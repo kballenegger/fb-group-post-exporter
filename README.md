@@ -1,0 +1,107 @@
+# FB Group Posts Export by User
+
+A Tampermonkey userscript for exporting your own posts from a single Facebook
+group as a JSON file plus a ZIP of photos.
+
+The script is strictly URL-driven — it only runs on
+`https://www.facebook.com/groups/<gid>/user/<uid>/` pages, which are the
+per-member-in-group views Facebook already shows you. It reads what's
+rendered in your own logged-in browser session and saves it locally. Nothing
+is uploaded anywhere.
+
+## Requirements
+
+- A Chromium-based browser (Chrome, Brave, Edge, Chromium)
+- [Tampermonkey](https://www.tampermonkey.net/) (or a compatible userscript
+  manager such as Violentmonkey)
+- A Facebook account that is a member of the group you want to export from
+
+## Install the userscript
+
+1. Install Tampermonkey from the browser's extension store.
+2. Open Tampermonkey's dashboard → **Create a new script**.
+3. Replace the placeholder contents with the contents of
+   [`export-group-posts-by-user.user.js`](./export-group-posts-by-user.user.js).
+4. Save (Cmd/Ctrl-S). Tampermonkey will pick up the `==UserScript==` header
+   and register the `@match` pattern.
+5. Ensure the script is **enabled** in the Tampermonkey dashboard.
+
+The `@require` directive pulls in [JSZip](https://stuk.github.io/jszip/)
+from cdnjs, so you do not need to vendor it manually when running through
+Tampermonkey.
+
+## Use
+
+1. In your logged-in browser, visit the group you want to export from.
+2. Click your own name/avatar to open the group's **"Your activity"** /
+   member view. The URL should look like:
+
+   ```
+   https://www.facebook.com/groups/<groupId>/user/<yourUserId>/
+   ```
+
+3. A small dark panel appears in the bottom-right corner titled
+   `Export: group <gid> / user <uid>`, with two buttons:
+   - **Full Scan + Export** — auto-scrolls the entire feed, expands
+     "See more", crawls multi-photo carousels, and then downloads a JSON file
+     plus a photo ZIP.
+   - **Export Loaded Now** — exports only what is currently rendered in the
+     DOM (useful for testing or quick spot exports).
+
+4. When the run finishes you'll get two downloads:
+   - `fb-group-<gid>-user-<uid>-<timestamp>.json` — one record per post:
+     permalink, timestamp, text, and photo URLs.
+   - `fb-photos-<gid>-user-<uid>-<timestamp>.zip` — one folder per post
+     (`post-001/photo-01.jpg`, …), plus a `manifest.json` and, if any
+     downloads failed, a `photo-failures.json`.
+
+## Tuning
+
+All runtime knobs live in the `CONFIG` object at the top of the userscript:
+
+- `MAX_PHOTOS_PER_POST`, `MAX_TOTAL_PHOTOS` — photo download caps.
+- `SCROLL_INTERVAL_MS`, `MAX_SCROLL_ATTEMPTS`, `IDLE_THRESHOLD` —
+  auto-scroll pacing.
+- `EOF_*` — end-of-feed detection thresholds.
+- `GALLERY_CRAWL_ENABLED`, `GALLERY_CRAWL_*` — controls the hidden-photo
+  crawler that fetches photo-viewer pages via `GM_xmlhttpRequest`.
+- `CAROUSEL_SCRIPT_EXTRACT_ENABLED` / `CAROUSEL_CRAWL_ENABLED` — toggles
+  for the two carousel extraction strategies (embedded script state vs.
+  interactive photo viewer; see [DEVELOPMENT.md](./DEVELOPMENT.md)).
+- `DRY_RUN` — emit validation summary to the console but skip the
+  downloads.
+
+## Notes and caveats
+
+- Facebook's DOM and script-state formats change without warning; extraction
+  is best-effort. The validation summary logged to the browser console
+  (and to `meta.extraction_stats` in the exported JSON) will tell you what
+  the run saw and which heuristics fired.
+- For very long activity feeds the export can take a while — the status
+  line in the panel shows live progress.
+- Running this may violate Facebook's Terms of Service. Use at your own
+  risk and only on your own account / your own content.
+
+## Developer / CDP harness
+
+If you want to debug the userscript or automate it headlessly, there is a
+CDP (Chrome DevTools Protocol) runner in [`run.mjs`](./run.mjs). It attaches
+to a Chrome instance launched with `--remote-debugging-port=9222`, injects a
+`GM_xmlhttpRequest` shim, loads the unmodified userscript, auto-clicks
+**Full Scan + Export**, and saves the resulting JSON/ZIP into `output/`.
+
+See [DEVELOPMENT.md](./DEVELOPMENT.md) for the architecture and the
+extraction pipeline in detail.
+
+Quick start:
+
+```sh
+# 1. Launch Chrome with remote debugging (dedicated profile)
+./launch-chrome.sh
+
+# 2. Log in to Facebook in the launched window.
+
+# 3. Run the exporter against your target URL
+FB_EXPORT_URL="https://www.facebook.com/groups/<gid>/user/<uid>/" \
+    node run.mjs
+```

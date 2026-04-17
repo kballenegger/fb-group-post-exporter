@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Local exporter output (real scraped data + per-run zips)
+output/
+
+# Captured Facebook traffic used only during debugging
+# (contains session-scoped cursors, viewer info, and post IDs)
+graphql-captured.json
+graphql-photo-raw.json
+
+# Personal per-run notes (filename includes group/user IDs)
+facebook-group-exporter-*.md
+
+# Local Claude settings
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
