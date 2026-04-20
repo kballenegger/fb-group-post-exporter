@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.0.0
+// @version      4.0.1
 // @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
 // @author       Kenneth
 // @match        https://www.facebook.com/groups/*/user/*
 // @grant        GM_xmlhttpRequest
 // @connect      fbcdn.net
+// @connect      *.fbcdn.net
 // @connect      www.facebook.com
 // @connect      cdnjs.cloudflare.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
@@ -116,6 +117,8 @@
       return rawUrl;
     }
   }
+
+  const photoFetchCandidatesByPath = new Map();
 
   /* ────────── permalink extraction ────────── */
 
@@ -423,6 +426,47 @@
     }
   }
 
+  function registerPhotoFetchCandidates(rawUrl) {
+    if (!rawUrl) return rawUrl;
+    const preferred = upgradeToHighRes(rawUrl);
+    const key = urlPathKey(preferred);
+    const existing = photoFetchCandidatesByPath.get(key) || [];
+    const candidates = [];
+
+    const pushUnique = (candidateUrl) => {
+      if (!candidateUrl) return;
+      if (!candidates.includes(candidateUrl)) {
+        candidates.push(candidateUrl);
+      }
+    };
+
+    // Prefer high-res variant first, then the original signed URL.
+    pushUnique(preferred);
+    pushUnique(rawUrl);
+    for (const candidate of existing) pushUnique(candidate);
+
+    photoFetchCandidatesByPath.set(key, candidates);
+    return preferred;
+  }
+
+  function getPhotoFetchCandidates(photoUrl) {
+    if (!photoUrl) return [];
+    const key = urlPathKey(photoUrl);
+    const existing = photoFetchCandidatesByPath.get(key) || [];
+    const ordered = [];
+
+    const pushUnique = (candidateUrl) => {
+      if (!candidateUrl) return;
+      if (!ordered.includes(candidateUrl)) {
+        ordered.push(candidateUrl);
+      }
+    };
+
+    pushUnique(photoUrl);
+    for (const candidate of existing) pushUnique(candidate);
+    return ordered;
+  }
+
   /**
    * Check if a URL is a Facebook styled-text-post background pattern
    * (decorative, not user content). These use type segment like t39.10873-6.
@@ -454,11 +498,11 @@
       if (!url || !isFbCdnUrl(url)) return;
       if (isAvatarUrl(url) || isStaticAssetUrl(url)) return;
       if (isDecorativeBackground(url)) return;
-      const upgraded = upgradeToHighRes(url);
-      const key = urlPathKey(upgraded);
+      const preferred = registerPhotoFetchCandidates(url);
+      const key = urlPathKey(preferred);
       if (seen.has(key)) return;
       seen.add(key);
-      urls.push(upgraded);
+      urls.push(preferred);
     }
 
     // 1. Primary feed images — most reliable signal (skip if inside comments)
@@ -729,11 +773,11 @@
       const { photos, nextLinks } = parseGalleryPagePhotos(html);
 
       for (const photoUrl of photos) {
-        const upgraded = upgradeToHighRes(photoUrl);
-        const key = urlPathKey(upgraded);
+        const preferred = registerPhotoFetchCandidates(photoUrl);
+        const key = urlPathKey(preferred);
         if (!existingKeys.has(key)) {
           existingKeys.add(key);
-          discoveredUrls.push(upgraded);
+          discoveredUrls.push(preferred);
           extractionStats.hidden_photos_discovered++;
         }
       }
@@ -840,12 +884,12 @@
         if (fb.length !== fbidLen || !fb.startsWith(commonPrefix)) continue;
 
         const isThumb = /stp=(?:dst-jpg|cp0_dst-jpg|c\d+\.\d+\.\d+\.\d+)/i.test(url);
-        const upgraded = upgradeToHighRes(url);
+        const preferred = registerPhotoFetchCandidates(url);
 
         if (!urisByFbid.has(fb)) {
-          urisByFbid.set(fb, { url: upgraded, thumb: isThumb });
+          urisByFbid.set(fb, { url: preferred, thumb: isThumb });
         } else if (urisByFbid.get(fb).thumb && !isThumb) {
-          urisByFbid.set(fb, { url: upgraded, thumb: false });
+          urisByFbid.set(fb, { url: preferred, thumb: false });
         }
       }
     }
@@ -918,7 +962,7 @@
     }
 
     if (bestUrl && isFbCdnUrl(bestUrl) && !isAvatarUrl(bestUrl)) {
-      return upgradeToHighRes(bestUrl);
+      return registerPhotoFetchCandidates(bestUrl);
     }
     return null;
   }
@@ -1760,6 +1804,12 @@
         method: 'GET',
         url: url,
         responseType: 'arraybuffer',
+        headers: {
+          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          Referer: 'https://www.facebook.com/',
+          Origin: 'https://www.facebook.com',
+        },
+        anonymous: false,
         timeout: CONFIG.PHOTO_FETCH_TIMEOUT_MS,
         onload: (resp) => {
           if (resp.status >= 200 && resp.status < 300) {
@@ -1772,6 +1822,31 @@
         ontimeout: () => reject(new Error('Timeout')),
       });
     });
+  }
+
+  async function fetchImageWithFallback(photoUrl) {
+    const candidates = getPhotoFetchCandidates(photoUrl);
+    if (candidates.length === 0) {
+      throw new Error('No candidate URL available');
+    }
+
+    let lastError = null;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidateUrl = candidates[i];
+      try {
+        const buffer = await fetchImageAsArrayBuffer(candidateUrl);
+        return { buffer, attempts: i + 1 };
+      } catch (e) {
+        lastError = e;
+        if (i < candidates.length - 1) {
+          log(
+            `Photo fetch fallback ${i + 1}/${candidates.length - 1} failed (${e.message}). Retrying alternate URL.`
+          );
+        }
+      }
+    }
+
+    throw lastError || new Error('Unknown photo fetch failure');
   }
 
   function guessExtension(url) {
@@ -1830,6 +1905,11 @@
     const zip = new JSZipRef();
     const failures = [];
     let totalPhotos = 0;
+    let attemptedPhotos = 0;
+    const totalPlannedPhotos = posts.reduce(
+      (sum, p) => sum + Math.min((p.photos || []).length, CONFIG.MAX_PHOTOS_PER_POST),
+      0
+    );
 
     for (let i = 0; i < posts.length; i++) {
       const post = posts[i];
@@ -1847,15 +1927,19 @@
         const photoUrl = photosToFetch[j];
         const ext = guessExtension(photoUrl);
         const filename = `${postDir}/photo-${String(j + 1).padStart(2, '0')}.${ext}`;
+        attemptedPhotos++;
 
         statusFn(
-          `Downloading photos… ${totalPhotos + 1} (post ${i + 1}/${posts.length})`
+          `Downloading photos… ${attemptedPhotos}/${totalPlannedPhotos} (ok ${totalPhotos}, failed ${failures.length})`
         );
 
         try {
-          const buf = await fetchImageAsArrayBuffer(photoUrl);
-          zip.file(filename, buf);
+          const { buffer, attempts } = await fetchImageWithFallback(photoUrl);
+          zip.file(filename, buffer);
           totalPhotos++;
+          if (attempts > 1) {
+            log(`Recovered photo via fallback URL (${attempts} attempt(s)): ${filename}`);
+          }
         } catch (e) {
           failures.push({
             post_index: i + 1,

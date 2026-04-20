@@ -74,9 +74,17 @@ const PRELUDE_SHIM = `
       if (targetOrigin === location.origin) creds = 'include';
       else creds = 'omit';
     } catch { /* fall through */ }
+    const sanitizedHeaders = {};
+    for (const [k, v] of Object.entries(opts.headers || {})) {
+      const name = String(k).toLowerCase();
+      // Browser fetch forbids setting these manually in page context.
+      if (name === 'referer' || name === 'origin' || name === 'cookie' || name === 'host') continue;
+      sanitizedHeaders[k] = v;
+    }
+
     const init = {
       method: opts.method || 'GET',
-      headers: opts.headers || {},
+      headers: sanitizedHeaders,
       credentials: creds,
     };
 
