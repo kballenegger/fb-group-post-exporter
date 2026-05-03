@@ -4,22 +4,25 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 
 const inputPath = process.argv[2];
-const maybeZipPath = process.argv[3] && /\.zip$/i.test(process.argv[3]) ? process.argv[3] : '';
-const outputArg = maybeZipPath ? process.argv[4] : process.argv[3];
+const isZipInput = inputPath && /\.zip$/i.test(inputPath);
+const maybeZipPath = isZipInput
+  ? inputPath
+  : process.argv[3] && /\.zip$/i.test(process.argv[3])
+    ? process.argv[3]
+    : '';
+const outputArg = isZipInput ? process.argv[3] : maybeZipPath ? process.argv[4] : process.argv[3];
 const outputPath =
   outputArg ||
   (inputPath
-    ? inputPath.replace(/\.json$/i, '') + '.html'
+    ? inputPath.replace(/\.(json|zip)$/i, '') + '.html'
     : '');
 
 if (!inputPath || !outputPath) {
   console.error('Usage: node render-export.mjs <export.json> [export.zip] [output.html]');
+  console.error('   or: node render-export.mjs <export.zip> [output.html]');
   process.exit(1);
 }
 
-const data = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
-const posts = Array.isArray(data.posts) ? data.posts : [];
-const meta = data.meta || {};
 const outputDir = path.dirname(path.resolve(outputPath));
 const outputBase = path.basename(outputPath, path.extname(outputPath));
 const assetDir = path.join(outputDir, `${outputBase}_files`);
@@ -35,6 +38,24 @@ if (maybeZipPath) {
     process.exit(unzip.status || 1);
   }
 }
+
+let data;
+if (isZipInput) {
+  const exportJsonPath = path.join(assetDir, 'export.json');
+  const manifestJsonPath = path.join(assetDir, 'manifest.json');
+  if (fs.existsSync(exportJsonPath)) {
+    data = JSON.parse(fs.readFileSync(exportJsonPath, 'utf8'));
+  } else if (fs.existsSync(manifestJsonPath)) {
+    data = { meta: {}, posts: JSON.parse(fs.readFileSync(manifestJsonPath, 'utf8')) };
+  } else {
+    console.error(`Could not find export.json inside ${inputPath}`);
+    process.exit(1);
+  }
+} else {
+  data = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+}
+const posts = Array.isArray(data.posts) ? data.posts : [];
+const meta = data.meta || {};
 
 function escapeHtml(value) {
   return String(value ?? '')

@@ -1,7 +1,7 @@
 # FB Group Posts Export by User
 
 A Tampermonkey userscript for exporting your own posts from a single Facebook
-group as a JSON file plus a ZIP of photos.
+group as a ZIP containing JSON plus downloaded photos.
 
 The script is strictly URL-driven — it only runs on
 `https://www.facebook.com/groups/<gid>/user/<uid>/` pages, which are the
@@ -26,9 +26,8 @@ is uploaded anywhere.
    and register the `@match` pattern.
 5. Ensure the script is **enabled** in the Tampermonkey dashboard.
 
-The `@require` directive pulls in [JSZip](https://stuk.github.io/jszip/)
-from cdnjs, so you do not need to vendor it manually when running through
-Tampermonkey.
+The userscript includes a small built-in ZIP writer, so it does not need a
+network-loaded ZIP dependency when running through Tampermonkey.
 
 ## Use
 
@@ -43,17 +42,37 @@ Tampermonkey.
 3. A small dark panel appears in the bottom-right corner titled
    `Export: group <gid> / user <uid>`, with two buttons:
    - **Full Scan + Export** — auto-scrolls the entire feed, expands
-     "See more", crawls multi-photo carousels, and then downloads a JSON file
-     plus a photo ZIP.
+     "See more", crawls multi-photo carousels, and then downloads one ZIP.
    - **Export Loaded Now** — exports only what is currently rendered in the
      DOM (useful for testing or quick spot exports).
 
-4. When the run finishes you'll get two downloads:
-   - `fb-group-<gid>-user-<uid>-<timestamp>.json` — one record per post:
-     permalink, timestamp, text, and photo URLs.
-   - `fb-photos-<gid>-user-<uid>-<timestamp>.zip` — one folder per post
-     (`post-001/photo-01.jpg`, …), plus a `manifest.json` and, if any
-     downloads failed, a `photo-failures.json`.
+4. When the run finishes you'll get one download:
+   - `fb-export-<gid>-user-<uid>-<timestamp>.zip`
+   - `export.json` inside the ZIP has one record per post: permalink,
+     timestamp, text, external links, and photo URLs.
+   - Downloaded photos are stored by post (`post-001/photo-01.jpg`, …).
+   - If any photo downloads fail, the ZIP also includes `photo-failures.json`.
+
+## Render an export as HTML
+
+Use [`render-export.mjs`](./render-export.mjs) to turn an export ZIP into a
+local, viewable HTML file:
+
+```sh
+node render-export.mjs fb-export-<gid>-user-<uid>-<timestamp>.zip
+```
+
+This writes `fb-export-<gid>-user-<uid>-<timestamp>.html` beside the ZIP and
+extracts local image assets into a matching `_files/` folder. The generated
+HTML references those local files, so it can be opened without a logged-in
+Facebook session.
+
+The renderer also supports older two-file exports:
+
+```sh
+node render-export.mjs fb-group-<gid>-user-<uid>-<timestamp>.json \
+  fb-photos-<gid>-user-<uid>-<timestamp>.zip
+```
 
 ## Tuning
 
@@ -69,7 +88,7 @@ All runtime knobs live in the `CONFIG` object at the top of the userscript:
   for the two carousel extraction strategies (embedded script state vs.
   interactive photo viewer; see [DEVELOPMENT.md](./DEVELOPMENT.md)).
 - `DRY_RUN` — emit validation summary to the console but skip the
-  downloads.
+  ZIP download.
 
 ## Notes and caveats
 
@@ -88,7 +107,7 @@ If you want to debug the userscript or automate it headlessly, there is a
 CDP (Chrome DevTools Protocol) runner in [`run.mjs`](./run.mjs). It attaches
 to a Chrome instance launched with `--remote-debugging-port=9222`, injects a
 `GM_xmlhttpRequest` shim, loads the unmodified userscript, auto-clicks
-**Full Scan + Export**, and saves the resulting JSON/ZIP into `output/`.
+**Full Scan + Export**, and saves the resulting ZIP into `output/`.
 
 See [DEVELOPMENT.md](./DEVELOPMENT.md) for the architecture and the
 extraction pipeline in detail.

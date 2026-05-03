@@ -162,8 +162,13 @@ const PRELUDE_SHIM = `
   };
 
   // ── Auto-click Full Scan + Export once the panel appears ──
+  function findExportButton() {
+    const host = document.getElementById('fb-export-panel-host');
+    const root = host && host.shadowRoot ? host.shadowRoot : document;
+    return root.getElementById('fb-export-full-btn') || document.getElementById('fb-export-full-btn');
+  }
   const autoStartObserver = new MutationObserver(() => {
-    const btn = document.getElementById('fb-export-full-btn');
+    const btn = findExportButton();
     if (btn) {
       autoStartObserver.disconnect();
       console.log('[FB-Export] CDP: auto-clicking Full Scan + Export button.');
@@ -171,15 +176,12 @@ const PRELUDE_SHIM = `
       // Slight delay so the script's own initialization finishes
       setTimeout(() => btn.click(), 500);
 
-      // Mark done when the JSON download lands
+      // Mark done when the ZIP download lands. The JSON lives inside it.
       const doneCheck = setInterval(() => {
-        const hasJson = window.__FB_EXPORT_FILES.some((f) => f.filename.endsWith('.json'));
-        if (hasJson) {
-          // Wait an extra few seconds for the photo zip to also land
-          setTimeout(() => {
-            window.__FB_EXPORT_STATUS = 'done';
-            clearInterval(doneCheck);
-          }, 4000);
+        const hasZip = window.__FB_EXPORT_FILES.some((f) => f.filename.endsWith('.zip'));
+        if (hasZip) {
+          window.__FB_EXPORT_STATUS = 'done';
+          clearInterval(doneCheck);
         }
       }, 1000);
     }
@@ -323,22 +325,28 @@ async function main() {
     console.log(`  → ${outPath} (${buf.length} bytes)`);
   }
 
-  // If we got the JSON, print summary stats
-  const jsonFile = files.find((f) => f.filename.endsWith('.json'));
-  if (jsonFile) {
+  // If the ZIP contains export.json, print summary stats
+  const zipFile = files.find((f) => f.filename.endsWith('.zip'));
+  if (zipFile) {
     try {
-      const data = JSON.parse(Buffer.from(jsonFile.data).toString('utf-8'));
+      const { execFileSync } = await import('child_process');
+      const tmpZipPath = path.join(OUTPUT_DIR, '_latest-export-summary.zip');
+      fs.writeFileSync(tmpZipPath, Buffer.from(zipFile.data));
+      const exportJson = execFileSync('unzip', ['-p', tmpZipPath, 'export.json'], {
+        encoding: 'utf8',
+      });
+      const data = JSON.parse(exportJson);
       console.log('\n── Extraction summary ──');
       console.log('Posts:', data.meta.post_count);
       console.log('Stats:', JSON.stringify(data.meta.extraction_stats, null, 2));
       console.log('Carousel debug:', JSON.stringify(data.meta.carousel_control_debug, null, 2));
     } catch (err) {
-      console.warn('Could not parse JSON for summary:', err.message);
+      console.warn('Could not parse export.json from ZIP for summary:', err.message);
     }
   }
 
-  console.log('\nLeaving browser open for inspection. Disconnect with Ctrl+C.');
-  // browser.disconnect();  // intentionally not closing
+  console.log('\nLeaving browser open for inspection. Disconnecting CDP runner.');
+  browser.disconnect();
 }
 
 main().catch((err) => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.1.4
+// @version      4.1.5
 // @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
 // @author       Kenneth
 // @match        https://facebook.com/groups/*/user/*
@@ -52,7 +52,8 @@
     GALLERY_CRAWL_MAX_PAGES_PER_POST: 30,
 
     // ── Carousel (interactive photo viewer) crawl ────────────
-    CAROUSEL_CRAWL_ENABLED: false,         // Interactive viewer fallback (can lose feed state); prefer script-state extraction
+    CAROUSEL_CRAWL_ENABLED: false,         // Broad interactive viewer fallback; targeted capped-photo recovery uses the setting below
+    CAROUSEL_CRAWL_TARGETED_CAPS_ENABLED: true, // Open only +N/capped photo grids to recover hidden photos
     CAROUSEL_SCRIPT_EXTRACT_ENABLED: false,  // General scan off by default; targeted multi-photo enrichment still runs
     CAROUSEL_CRAWL_MAX_PHOTOS: 100,        // Max images to capture per carousel session
     CAROUSEL_CRAWL_NAV_DELAY_MS: 600,      // Delay between carousel navigation steps
@@ -1053,7 +1054,22 @@
     const viewer = findPhotoViewerOverlay();
     if (!viewer) return null;
 
-    const img = viewer.img;
+    const imgs = [...viewer.container.querySelectorAll('img[src*="scontent"], img[src*="fbcdn"]')]
+      .filter((candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.width < 80 || rect.height < 80) return false;
+        const src = candidate.currentSrc || candidate.src || '';
+        if (!isFbCdnUrl(src)) return false;
+        if (isAvatarUrl(src) || isStaticAssetUrl(src) || isExternalPreviewUrl(src)) return false;
+        return true;
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.width * br.height) - (ar.width * ar.height);
+      });
+
+    const img = imgs[0] || viewer.img;
     let bestUrl = img.src;
 
     // Check srcset for even higher-res
@@ -1143,7 +1159,26 @@
     const container = viewer.container;
     carouselDebug.next_selector_attempts++;
 
-    // ── Strategy 1: SVG path fingerprint (most reliable) ──
+    const buttons = container.querySelectorAll('[role="button"], button');
+    const viewerRect = container.getBoundingClientRect();
+    const midX = viewerRect.left + viewerRect.width / 2;
+    const midY = viewerRect.top + viewerRect.height / 2;
+
+    // ── Strategy 1: explicit aria-label (worked reliably in current FB viewer) ──
+    const nextPatterns = /^(next|siguiente|suivant|n[äa]chste|avanti|berikutnya|tiếp|ถัดไป|التالي|अगला|次|다음|下一[个張]|next photo)$/i;
+    for (const btn of buttons) {
+      if (!container.contains(btn)) continue;
+      if (!isVisibleAndEnabled(btn)) { carouselDebug.rejected_next_candidates++; continue; }
+      const label = btn.getAttribute('aria-label') || '';
+      const btnRect = btn.getBoundingClientRect();
+      // "Previous photo" can share similar SVG geometry; labels avoid that.
+      if (nextPatterns.test(label.trim()) && btnRect.left > midX) {
+        log(`Carousel next: found via aria-label="${label.trim()}".`);
+        return { btn, strategy: 'aria_label' };
+      }
+    }
+
+    // ── Strategy 2: SVG path fingerprint ──
     const allPaths = container.querySelectorAll('svg path[d]');
     for (const pathEl of allPaths) {
       const d = pathEl.getAttribute('d') || '';
@@ -1155,7 +1190,13 @@
           candidate = pathEl.closest('svg');
           if (candidate) candidate = candidate.closest('[role="button"], button, a');
         }
-        if (candidate && container.contains(candidate) && isVisibleAndEnabled(candidate)) {
+        const candidateRect = candidate ? candidate.getBoundingClientRect() : null;
+        if (
+          candidate &&
+          container.contains(candidate) &&
+          isVisibleAndEnabled(candidate) &&
+          candidateRect.left > midX
+        ) {
           log('Carousel next: found via SVG path fingerprint.');
           return { btn: candidate, strategy: 'svg_path_fingerprint' };
         }
@@ -1163,12 +1204,7 @@
       }
     }
 
-    // ── Strategy 2: viewBox="0 0 24 24" SVGs inside right-side buttons ──
-    const buttons = container.querySelectorAll('[role="button"], button');
-    const viewerRect = container.getBoundingClientRect();
-    const midX = viewerRect.left + viewerRect.width / 2;
-    const midY = viewerRect.top + viewerRect.height / 2;
-
+    // ── Strategy 3: viewBox="0 0 24 24" SVGs inside right-side buttons ──
     const rightButtons = [];
     for (const btn of buttons) {
       if (!container.contains(btn)) continue;
@@ -1189,18 +1225,6 @@
       rightButtons.sort((a, b) => a.distFromCenter - b.distFromCenter);
       log(`Carousel next: found via position (right-side, ${rightButtons.length} candidates).`);
       return { btn: rightButtons[0].btn, strategy: 'position_right_side' };
-    }
-
-    // ── Strategy 3: aria-label fallback (multi-language next patterns) ──
-    const nextPatterns = /^(next|siguiente|suivant|n[äa]chste|avanti|berikutnya|tiếp|ถัดไป|التالي|अगला|次|다음|下一[个張]|next photo)$/i;
-    for (const btn of buttons) {
-      if (!container.contains(btn)) continue;
-      if (!isVisibleAndEnabled(btn)) { carouselDebug.rejected_next_candidates++; continue; }
-      const label = btn.getAttribute('aria-label') || '';
-      if (nextPatterns.test(label.trim())) {
-        log(`Carousel next: found via aria-label="${label.trim()}".`);
-        return { btn, strategy: 'aria_label' };
-      }
     }
 
     log('Carousel next: no valid next button found in viewer.');
@@ -1228,6 +1252,43 @@
     }));
     carouselDebug.next_clicks++;
     return { clicked: true, strategy: 'keyboard_j' };
+  }
+
+  function parseRemainingPhotoCount(text) {
+    const value = String(text || '');
+    const plus = value.match(/\+(\d{1,3})\b/);
+    if (plus) return parseInt(plus[1], 10);
+    const remaining = value.match(/\b(\d{1,3})\s+remaining items?\b/i);
+    return remaining ? parseInt(remaining[1], 10) : 0;
+  }
+
+  function getPhotoLinkRemainingCount(link) {
+    const text = link.innerText || link.textContent || '';
+    const label = link.getAttribute('aria-label') || '';
+    return Math.max(parseRemainingPhotoCount(text), parseRemainingPhotoCount(label));
+  }
+
+  function findCarouselEntryLink(postEl) {
+    const links = [...postEl.querySelectorAll('a[href*="/photo/"]')]
+      .filter((link) => !isInsideComment(link));
+    if (links.length === 0) return null;
+
+    // Prefer the "+N remaining items" tile. Starting there lets the viewer
+    // reveal hidden photos before looping back to the visible thumbnails.
+    const plusLink = links
+      .map((link) => ({ link, remaining: getPhotoLinkRemainingCount(link) }))
+      .filter((entry) => entry.remaining > 0)
+      .sort((a, b) => b.remaining - a.remaining)[0];
+    if (plusLink) return plusLink.link;
+
+    return links[0];
+  }
+
+  function hasCappedPhotoGrid(postEl, inlinePhotos) {
+    for (const link of postEl.querySelectorAll('a[href*="/photo/"]')) {
+      if (getPhotoLinkRemainingCount(link) > 0) return true;
+    }
+    return (inlinePhotos || []).length >= 5;
   }
 
   /**
@@ -1284,11 +1345,12 @@
    * @param {string[]} existingUrls - already-known photo URLs for dedup
    * @returns {string[]} newly discovered photo URLs
    */
-  async function crawlCarousel(postEl, existingUrls) {
-    if (!CONFIG.CAROUSEL_CRAWL_ENABLED) return [];
+  async function crawlCarousel(postEl, existingUrls, options = {}) {
+    const force = !!options.force;
+    if (!CONFIG.CAROUSEL_CRAWL_ENABLED && !force) return [];
 
     // Find a clickable photo link in the post
-    const photoLink = postEl.querySelector('a[href*="/photo/"]');
+    const photoLink = options.entryLink || findCarouselEntryLink(postEl);
     if (!photoLink) return [];
 
     const existingKeys = new Set(existingUrls.map(urlPathKey));
@@ -1693,8 +1755,16 @@
           extractionStats.carousel_photos_captured += carouselPhotos.length;
         }
       }
-      if (CONFIG.CAROUSEL_CRAWL_ENABLED) {
-        const viewerPhotos = await crawlCarousel(article, [...allKnownSoFar, ...carouselPhotos]);
+      const cappedPhotoGrid = !isLinkPost && hasCappedPhotoGrid(article, inlinePhotos);
+      const shouldTargetViewer =
+        cappedPhotoGrid &&
+        CONFIG.CAROUSEL_CRAWL_TARGETED_CAPS_ENABLED &&
+        [...allKnownSoFar, ...carouselPhotos].length < CONFIG.MAX_PHOTOS_PER_POST;
+      if (CONFIG.CAROUSEL_CRAWL_ENABLED || shouldTargetViewer) {
+        const viewerPhotos = await crawlCarousel(article, [...allKnownSoFar, ...carouselPhotos], {
+          force: shouldTargetViewer,
+          entryLink: shouldTargetViewer ? findCarouselEntryLink(article) : null,
+        });
         carouselPhotos = [...carouselPhotos, ...viewerPhotos];
       }
 
@@ -2154,8 +2224,8 @@
     }, 1000);
   }
 
-  function downloadJSON(posts) {
-    const output = {
+  function buildExportPayload(posts) {
+    return {
       meta: {
         group_id: groupId,
         user_id: userId,
@@ -2166,19 +2236,13 @@
       },
       posts,
     };
-    const blob = new Blob([JSON.stringify(output, null, 2)], {
-      type: 'application/json',
-    });
-    downloadBlob(
-      blob,
-      `fb-group-${groupId}-user-${userId}-${Date.now()}.json`
-    );
   }
 
   /* ────────── photo ZIP pipeline ────────── */
 
-  async function buildPhotoZip(posts, statusFn) {
+  async function buildExportZip(posts, statusFn) {
     const zip = new SimpleZip();
+    const exportPayload = buildExportPayload(posts);
     const failures = [];
     let totalPhotos = 0;
     let attemptedPhotos = 0;
@@ -2187,50 +2251,53 @@
       0
     );
 
-    for (let i = 0; i < posts.length; i++) {
-      const post = posts[i];
-      if (!post.photos || post.photos.length === 0) continue;
+    zip.file('export.json', JSON.stringify(exportPayload, null, 2));
 
-      const postDir = `post-${String(i + 1).padStart(3, '0')}`;
-      const photosToFetch = post.photos.slice(0, CONFIG.MAX_PHOTOS_PER_POST);
+    if (CONFIG.DOWNLOAD_PHOTOS) {
+      for (let i = 0; i < posts.length; i++) {
+        const post = posts[i];
+        if (!post.photos || post.photos.length === 0) continue;
 
-      for (let j = 0; j < photosToFetch.length; j++) {
-        if (totalPhotos >= CONFIG.MAX_TOTAL_PHOTOS) {
-          log(`Global photo cap (${CONFIG.MAX_TOTAL_PHOTOS}) reached.`);
-          break;
-        }
+        const postDir = `post-${String(i + 1).padStart(3, '0')}`;
+        const photosToFetch = post.photos.slice(0, CONFIG.MAX_PHOTOS_PER_POST);
 
-        const photoUrl = photosToFetch[j];
-        const ext = guessExtension(photoUrl);
-        const filename = `${postDir}/photo-${String(j + 1).padStart(2, '0')}.${ext}`;
-        attemptedPhotos++;
-
-        statusFn(
-          `Downloading photos… ${attemptedPhotos}/${totalPlannedPhotos} (ok ${totalPhotos}, failed ${failures.length})`
-        );
-
-        try {
-          const { buffer, attempts } = await fetchImageWithFallback(photoUrl);
-          zip.file(filename, buffer);
-          totalPhotos++;
-          if (attempts > 1) {
-            log(`Recovered photo via fallback URL (${attempts} attempt(s)): ${filename}`);
+        for (let j = 0; j < photosToFetch.length; j++) {
+          if (totalPhotos >= CONFIG.MAX_TOTAL_PHOTOS) {
+            log(`Global photo cap (${CONFIG.MAX_TOTAL_PHOTOS}) reached.`);
+            break;
           }
-        } catch (e) {
-          failures.push({
-            post_index: i + 1,
-            photo_index: j + 1,
-            url: photoUrl,
-            error: e.message,
-          });
-          warn(`Failed to fetch photo: ${filename} — ${e.message}`);
-        }
-      }
 
-      if (totalPhotos >= CONFIG.MAX_TOTAL_PHOTOS) break;
+          const photoUrl = photosToFetch[j];
+          const ext = guessExtension(photoUrl);
+          const filename = `${postDir}/photo-${String(j + 1).padStart(2, '0')}.${ext}`;
+          attemptedPhotos++;
+
+          statusFn(
+            `Downloading photos… ${attemptedPhotos}/${totalPlannedPhotos} (ok ${totalPhotos}, failed ${failures.length})`
+          );
+
+          try {
+            const { buffer, attempts } = await fetchImageWithFallback(photoUrl);
+            zip.file(filename, buffer);
+            totalPhotos++;
+            if (attempts > 1) {
+              log(`Recovered photo via fallback URL (${attempts} attempt(s)): ${filename}`);
+            }
+          } catch (e) {
+            failures.push({
+              post_index: i + 1,
+              photo_index: j + 1,
+              url: photoUrl,
+              error: e.message,
+            });
+            warn(`Failed to fetch photo: ${filename} — ${e.message}`);
+          }
+        }
+
+        if (totalPhotos >= CONFIG.MAX_TOTAL_PHOTOS) break;
+      }
     }
 
-    zip.file('manifest.json', JSON.stringify(posts, null, 2));
     if (failures.length > 0) {
       zip.file('photo-failures.json', JSON.stringify(failures, null, 2));
     }
@@ -2434,45 +2501,34 @@
       return;
     }
 
-    updateStatus(`Exporting ${total} posts as JSON…`);
-    downloadJSON(posts);
+    const totalPhotoUrls = posts.reduce(
+      (n, p) => n + (p.photos ? p.photos.length : 0),
+      0
+    );
+    const photoStatus = CONFIG.DOWNLOAD_PHOTOS
+      ? `${totalPhotoUrls} photo URLs found`
+      : 'photo download disabled';
+    updateStatus(`Building export ZIP (${photoStatus})…`);
 
-    if (CONFIG.DOWNLOAD_PHOTOS) {
-      const totalPhotoUrls = posts.reduce(
-        (n, p) => n + (p.photos ? p.photos.length : 0),
-        0
+    const result = await buildExportZip(posts, updateStatus);
+
+    updateStatus('Generating ZIP file…');
+    try {
+      const content = await result.zip.generateAsync({ type: 'blob' });
+      downloadBlob(
+        content,
+        `fb-export-${groupId}-user-${userId}-${Date.now()}.zip`
       );
-      if (totalPhotoUrls > 0) {
-        updateStatus(`Building photo ZIP (${totalPhotoUrls} URLs found)…`);
-        const result = await buildPhotoZip(posts, updateStatus);
-
-        if (result.zip) {
-          updateStatus('Generating ZIP file…');
-          try {
-            const content = await result.zip.generateAsync({ type: 'blob' });
-            downloadBlob(
-              content,
-              `fb-photos-${groupId}-user-${userId}-${Date.now()}.zip`
-            );
-            const failMsg =
-              result.failures.length > 0
-                ? ` (${result.failures.length} failed)`
-                : '';
-            updateStatus(
-              `Done! ${total} posts + ${result.totalPhotos} photos${failMsg}`
-            );
-          } catch (e) {
-            warn('ZIP generation failed:', e);
-            updateStatus(`Done! ${total} posts. ZIP failed: ${e.message}`);
-          }
-        } else {
-          updateStatus(`Done! ${total} posts (photo URLs in JSON, ZIP unavailable).`);
-        }
-      } else {
-        updateStatus(`Done! ${total} posts exported (no photos found).`);
-      }
-    } else {
-      updateStatus(`Done! ${total} posts exported (JSON only).`);
+      const failMsg =
+        result.failures.length > 0
+          ? ` (${result.failures.length} failed)`
+          : '';
+      updateStatus(
+        `Done! ${total} posts + ${result.totalPhotos} photos${failMsg}`
+      );
+    } catch (e) {
+      warn('ZIP generation failed:', e);
+      updateStatus(`Export failed: ${e.message}`);
     }
   }
 
