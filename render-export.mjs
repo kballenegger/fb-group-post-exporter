@@ -96,6 +96,19 @@ function localZipPhotoPath(postIndex, photoIndex) {
   return `${outputBase}_files/${postDirName}/${fileName}`;
 }
 
+function localZipPhotoFromEntry(entry, postIndex, photoIndex) {
+  if (!maybeZipPath) return '';
+  const raw = String(entry || '').trim();
+  if (/^https?:\/\//i.test(raw) || raw.startsWith('data:')) return '';
+  const normalized = raw.replace(/^\.?\//, '');
+  const onDisk = path.join(assetDir, normalized);
+  if (fs.existsSync(onDisk)) {
+    zipPhotoCount += 1;
+    return `${outputBase}_files/${normalized}`;
+  }
+  return localZipPhotoPath(postIndex, photoIndex);
+}
+
 const cards = posts
   .map((post, index) => {
     const links = post.external_links || [];
@@ -105,7 +118,7 @@ const cards = posts
           .map(
             (url, photoIndex) => `
               ${(() => {
-                const localPath = localZipPhotoPath(index, photoIndex);
+                const localPath = localZipPhotoFromEntry(url, index, photoIndex);
                 if (maybeZipPath && !localPath) {
                   missingZipPhotos.push({ post: index + 1, photo: photoIndex + 1, url });
                 }

@@ -135,6 +135,9 @@ const PRELUDE_SHIM = `
   // capture the blob bytes onto window.__FB_EXPORT_FILES.
   window.__FB_EXPORT_FILES = [];
   window.__FB_EXPORT_STATUS = 'starting';
+  window.__FB_EXPORT_DONE_CHECK = null;
+  window.__FB_EXPORT_DONE_TIMEOUT = null;
+  window.__FB_EXPORT_OBSERVER = null;
 
   // Snapshot original click before userscript runs
   const _origClick = HTMLAnchorElement.prototype.click;
@@ -160,6 +163,14 @@ const PRELUDE_SHIM = `
     }
     return _origClick.call(this);
   };
+  window.__FB_EXPORT_CLEANUP = function () {
+    try {
+      if (window.__FB_EXPORT_DONE_CHECK) clearInterval(window.__FB_EXPORT_DONE_CHECK);
+      if (window.__FB_EXPORT_DONE_TIMEOUT) clearTimeout(window.__FB_EXPORT_DONE_TIMEOUT);
+      if (window.__FB_EXPORT_OBSERVER) window.__FB_EXPORT_OBSERVER.disconnect();
+    } catch {}
+    HTMLAnchorElement.prototype.click = _origClick;
+  };
 
   // ── Auto-click Full Scan + Export once the panel appears ──
   function findExportButton() {
@@ -171,21 +182,30 @@ const PRELUDE_SHIM = `
     const btn = findExportButton();
     if (btn) {
       autoStartObserver.disconnect();
+      window.__FB_EXPORT_OBSERVER = null;
       console.log('[FB-Export] CDP: auto-clicking Full Scan + Export button.');
       window.__FB_EXPORT_STATUS = 'running';
       // Slight delay so the script's own initialization finishes
       setTimeout(() => btn.click(), 500);
 
       // Mark done when the ZIP download lands. The JSON lives inside it.
-      const doneCheck = setInterval(() => {
+      window.__FB_EXPORT_DONE_CHECK = setInterval(() => {
         const hasZip = window.__FB_EXPORT_FILES.some((f) => f.filename.endsWith('.zip'));
         if (hasZip) {
           window.__FB_EXPORT_STATUS = 'done';
-          clearInterval(doneCheck);
+          window.__FB_EXPORT_CLEANUP();
         }
       }, 1000);
+      // Safety timeout so debug hooks are always released.
+      window.__FB_EXPORT_DONE_TIMEOUT = setTimeout(() => {
+        if (window.__FB_EXPORT_STATUS !== 'done') {
+          window.__FB_EXPORT_STATUS = 'timeout';
+        }
+        window.__FB_EXPORT_CLEANUP();
+      }, 20 * 60 * 1000);
     }
   });
+  window.__FB_EXPORT_OBSERVER = autoStartObserver;
   autoStartObserver.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
@@ -212,8 +232,10 @@ async function main() {
   }
   console.log('Connected.');
 
-  const pages = await browser.pages();
-  let page = pages[0] || (await browser.newPage());
+  // Always use a dedicated tab for this run so we don't hijack an existing
+  // Facebook tab (which can look like "randomly opened main facebook.com").
+  const page = await browser.newPage();
+  await page.bringToFront();
 
   // Forward useful console output from the page
   page.on('console', (msg) => {

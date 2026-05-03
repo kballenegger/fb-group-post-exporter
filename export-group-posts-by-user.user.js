@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.1.5
+// @version      4.1.8
 // @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
 // @author       Kenneth
 // @match        https://facebook.com/groups/*/user/*
@@ -36,8 +36,9 @@
     // ── End-of-feed detection ────────────────────────────────
     EOF_CONSECUTIVE_CYCLES: 3,       // All hard-stop signals must hold for this many cycles
     EOF_TAIL_SIGNATURE_COUNT: 5,     // Number of tail post keys to track for re-observation
-    EOF_BOTTOM_PROBE_COUNT: 2,       // scrollTo(bottom) probes per cycle
-    EOF_HARD_STOP_IDLE_CYCLES: 5,    // Deterministic hard-stop: if N consecutive scroll cycles produce zero new posts, stop regardless of other signals
+    EOF_BOTTOM_PROBE_COUNT: 2,       // Stable-bottom probes per cycle
+    EOF_BOTTOM_PROBE_WAIT_MS: 1200,  // Wait after forcing bottom before checking stability
+    EOF_MIN_SCROLL_ATTEMPTS: 20,     // Guardrail: don't allow EOF stop to trigger too early in virtualized feeds
 
     // ── Photo download ─────────────────────────────────────────
     DOWNLOAD_PHOTOS: true,
@@ -248,11 +249,31 @@
 
   /* ────────── timestamp extraction ────────── */
 
+  function isTimestampLikeText(text) {
+    const t = String(text || '').trim();
+    if (!t) return false;
+    if (/^\+\d+$/.test(t)) return false; // "+4" overlay on multi-photo tiles
+    return /\b(\d{1,2}\s*(sec|min|hour|hr|day|week|month|year|y|mo|d|h|m)s?\b|yesterday|today|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}|at\s+\d)/i.test(
+      t
+    );
+  }
+
+  function isLikelyTimestampHref(href) {
+    const h = String(href || '');
+    return (
+      h.includes('/posts/') ||
+      h.includes('/permalink/') ||
+      h.includes('__cft__') ||
+      h.includes('/groups/' + groupId + '/')
+    );
+  }
+
   function extractTimestamp(postEl) {
     // 1. Classic <abbr> timestamps (older FB layout)
     const abbrEls = postEl.querySelectorAll('abbr[data-utime], abbr[title]');
     for (const el of abbrEls) {
-      return el.getAttribute('title') || el.textContent.trim();
+      const text = (el.getAttribute('title') || el.textContent || '').trim();
+      if (isTimestampLikeText(text)) return text;
     }
 
     // 2. Modern FB: aria-labelledby on timestamp links → hidden <span id="...">
@@ -260,13 +281,14 @@
     const labelledEls = postEl.querySelectorAll('a[aria-labelledby]');
     for (const el of labelledEls) {
       // Skip elements inside comments
-      if (el.closest('[role="article"]')) continue;
+      if (isInsideComment(el)) continue;
+      if (!isLikelyTimestampHref(el.href || '')) continue;
       const labelId = el.getAttribute('aria-labelledby');
       if (!labelId) continue;
       const labelEl = document.getElementById(labelId);
       if (labelEl) {
         const text = labelEl.textContent.trim();
-        if (text && text.length < 60 && /\d/.test(text)) return text;
+        if (text && text.length < 80 && isTimestampLikeText(text)) return text;
       }
     }
 
@@ -274,29 +296,23 @@
     const links = postEl.querySelectorAll('a[href]');
     for (const a of links) {
       // Skip links inside comment articles
-      if (a.closest('[role="article"]')) continue;
+      if (isInsideComment(a)) continue;
       const h = a.href || '';
-      if (
-        (h.includes('/posts/') || h.includes('/permalink/') || h.includes('__cft__')) &&
-        (h.includes(groupId) || h.includes('__cft__'))
-      ) {
+      if (isLikelyTimestampHref(h)) {
         const txt = a.textContent.trim();
-        if (txt.length > 0 && txt.length < 60 && /\d/.test(txt)) return txt;
+        if (txt.length > 0 && txt.length < 80 && isTimestampLikeText(txt)) return txt;
       }
     }
 
     // 4. aria-label with date-like patterns (skip comment articles)
     const ariaEls = postEl.querySelectorAll('[aria-label]');
     for (const el of ariaEls) {
-      if (el.closest('[role="article"]')) continue;
+      if (isInsideComment(el)) continue;
       const label = el.getAttribute('aria-label');
       if (
         label &&
-        label.length < 80 &&
-        /\d/.test(label) &&
-        /hour|min|sec|day|week|month|year|ago|am|pm|january|february|march|april|may|june|july|august|september|october|november|december/i.test(
-          label
-        )
+        label.length < 120 &&
+        isTimestampLikeText(label)
       ) {
         return label;
       }
@@ -1808,6 +1824,39 @@
     return newCount;
   }
 
+  function isGroupPostsSurfaceActive() {
+    return findPostElements().length > 0;
+  }
+
+  async function ensureGroupPostsSurface() {
+    if (isGroupPostsSurfaceActive()) return;
+
+    const candidates = [
+      ...document.querySelectorAll('[role="tab"], [role="link"], a, div[role="button"], span[role="button"]'),
+    ];
+    const groupPostsCandidates = candidates.filter((el) => {
+      const txt = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!txt || txt.length > 40) return false;
+      if (isInsideComment(el)) return false;
+      return txt === 'group posts';
+    });
+
+    for (const el of groupPostsCandidates) {
+      const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      try {
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        el.click();
+        await sleep(1800);
+        if (findPostElements().length > 0) {
+          log(`Activated posts surface via tab "${txt}".`);
+          return;
+        }
+      } catch {
+        // Ignore click failures and continue trying other candidates.
+      }
+    }
+  }
+
   /* ────────── scrolling with retry bursts ────────── */
 
   function sleep(ms) {
@@ -1845,10 +1894,22 @@
     let prevTailSig = '';            // previous tail signature for re-observation check
     let tailSigRepeatCount = 0;      // how many times we've seen the same tail signature
 
-    // ── Deterministic hard-stop: consecutive scroll cycles with zero new posts ──
-    let zeroNewPostCycles = 0;       // increments every scroll cycle with no new unique posts
+    // Telemetry: consecutive scroll cycles with zero new posts/DOM nodes.
+    // Used for status/debug only (not as an independent stop condition).
+    let zeroNewPostCycles = 0;
     let lastPostCount = collectedPosts.size;
     let lastDomNodeCount = findPostElements().length;  // raw DOM node count for independent tracking
+
+    async function confirmStableBottom() {
+      for (let p = 0; p < CONFIG.EOF_BOTTOM_PROBE_COUNT; p++) {
+        const beforeHeight = document.documentElement.scrollHeight;
+        window.scrollTo(0, beforeHeight);
+        await sleep(CONFIG.EOF_BOTTOM_PROBE_WAIT_MS);
+        const afterHeight = document.documentElement.scrollHeight;
+        if (!isAtBottom(10) || afterHeight > beforeHeight) return false;
+      }
+      return true;
+    }
 
     while (attempts < CONFIG.MAX_SCROLL_ATTEMPTS) {
       attempts++;
@@ -1890,19 +1951,8 @@
       lastPostCount = currSize;
       lastDomNodeCount = currDomNodeCount;
 
-      if (zeroNewPostCycles >= CONFIG.EOF_HARD_STOP_IDLE_CYCLES) {
-        const reason = `hard_stop_${zeroNewPostCycles}_idle_cycles_zero_dom_and_keys`;
-        extractionStats.end_of_feed_detected = true;
-        extractionStats.end_of_feed_reason = reason;
-        extractionStats.scroll_hard_stop_idle_count = zeroNewPostCycles;
-        extractionStats.scroll_hard_stop_dom_idle_count = zeroNewPostCycles;
-        log(`Hard-stop: ${zeroNewPostCycles} consecutive scroll cycles with zero new post DOM nodes AND zero new unique post keys. Stopping.`);
-        statusFn(`End of feed (hard-stop) — ${currSize} posts`);
-        break;
-      }
-
       statusFn(
-        `Scrolling… ${currSize} posts, ${currDomNodeCount} DOM nodes (scroll ${attempts}, idle ${idleCount}, noNewPost ${zeroNewPostCycles}/${CONFIG.EOF_HARD_STOP_IDLE_CYCLES})`
+        `Scrolling… ${currSize} posts, ${currDomNodeCount} DOM nodes (scroll ${attempts}, idle ${idleCount}, noNewPost ${zeroNewPostCycles})`
       );
 
       // ── End-of-feed signal evaluation ──
@@ -1913,16 +1963,8 @@
         // Signal 2: no scrollHeight increase (already tracked by idleCount)
         const noHeightGrowth = currHeight <= prevHeight;
 
-        // Signal 3: viewport at bottom after forced bottom probes
-        let atBottom = false;
-        for (let p = 0; p < CONFIG.EOF_BOTTOM_PROBE_COUNT; p++) {
-          window.scrollTo(0, document.documentElement.scrollHeight);
-          await sleep(300);
-          if (isAtBottom(10)) {
-            atBottom = true;
-            break;
-          }
-        }
+        // Signal 3: viewport at bottom and bottom is stable (no late height growth)
+        const atBottom = await confirmStableBottom();
 
         // Signal 4: tail post signatures unchanged
         const tailSig = getTailSignature(CONFIG.EOF_TAIL_SIGNATURE_COUNT);
@@ -1934,7 +1976,15 @@
         }
         const tailRepeated = tailSigRepeatCount >= 1;
 
-        const allSignals = noPostGrowth && noHeightGrowth && atBottom && tailRepeated;
+        const retriesExhausted = retryBudget <= 0;
+        const minAttemptsMet = attempts >= CONFIG.EOF_MIN_SCROLL_ATTEMPTS;
+        const allSignals =
+          minAttemptsMet &&
+          retriesExhausted &&
+          noPostGrowth &&
+          noHeightGrowth &&
+          atBottom &&
+          tailRepeated;
 
         if (allSignals) {
           eofCycleCount++;
@@ -1946,6 +1996,8 @@
         // Hard stop: all signals held for enough consecutive cycles
         if (eofCycleCount >= CONFIG.EOF_CONSECUTIVE_CYCLES) {
           const reasons = [
+            `min_attempts_${attempts}`,
+            'retries_exhausted',
             'no_post_growth',
             'no_height_growth',
             'viewport_at_bottom',
@@ -2242,7 +2294,11 @@
 
   async function buildExportZip(posts, statusFn) {
     const zip = new SimpleZip();
-    const exportPayload = buildExportPayload(posts);
+    const exportPosts = posts.map((post) => ({
+      ...post,
+      photos: [],
+      image_urls: [],
+    }));
     const failures = [];
     let totalPhotos = 0;
     let attemptedPhotos = 0;
@@ -2250,8 +2306,6 @@
       (sum, p) => sum + Math.min((p.photos || []).length, CONFIG.MAX_PHOTOS_PER_POST),
       0
     );
-
-    zip.file('export.json', JSON.stringify(exportPayload, null, 2));
 
     if (CONFIG.DOWNLOAD_PHOTOS) {
       for (let i = 0; i < posts.length; i++) {
@@ -2279,6 +2333,8 @@
           try {
             const { buffer, attempts } = await fetchImageWithFallback(photoUrl);
             zip.file(filename, buffer);
+            exportPosts[i].photos.push(filename);
+            exportPosts[i].image_urls.push(filename);
             totalPhotos++;
             if (attempts > 1) {
               log(`Recovered photo via fallback URL (${attempts} attempt(s)): ${filename}`);
@@ -2287,7 +2343,7 @@
             failures.push({
               post_index: i + 1,
               photo_index: j + 1,
-              url: photoUrl,
+              filename,
               error: e.message,
             });
             warn(`Failed to fetch photo: ${filename} — ${e.message}`);
@@ -2301,6 +2357,9 @@
     if (failures.length > 0) {
       zip.file('photo-failures.json', JSON.stringify(failures, null, 2));
     }
+
+    const exportPayload = buildExportPayload(exportPosts);
+    zip.file('export.json', JSON.stringify(exportPayload, null, 2));
 
     return { zip, totalPhotos, failures };
   }
@@ -2542,6 +2601,7 @@
     setButtonsEnabled(false);
 
     log('Full Scan + Export. Group:', groupId, 'User:', userId);
+    await ensureGroupPostsSurface();
     updateStatus('Expanding & scanning visible posts…');
 
     await scanCurrentPosts();
@@ -2570,6 +2630,7 @@
     setButtonsEnabled(false);
 
     log('Export Loaded Now. Group:', groupId, 'User:', userId);
+    await ensureGroupPostsSurface();
     updateStatus('Expanding & scanning loaded posts…');
 
     await scanCurrentPosts();
