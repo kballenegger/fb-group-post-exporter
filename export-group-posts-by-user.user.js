@@ -1,21 +1,25 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.0.1
+// @version      4.1.4
 // @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
 // @author       Kenneth
+// @match        https://facebook.com/groups/*/user/*
 // @match        https://www.facebook.com/groups/*/user/*
+// @match        https://web.facebook.com/groups/*/user/*
+// @include      /^https:\/\/(www\.|web\.)?facebook\.com\/groups\/\d+\/user\/\d+\/?.*/
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      fbcdn.net
 // @connect      *.fbcdn.net
 // @connect      www.facebook.com
-// @connect      cdnjs.cloudflare.com
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  console.log('[FB-Export] bootstrap loaded on', window.location.href);
 
   // ═══════════════════════════════════════════════════════════════
   // ██  CONFIG
@@ -40,18 +44,16 @@
     MAX_PHOTOS_PER_POST: 50,
     MAX_TOTAL_PHOTOS: 500,
     PHOTO_FETCH_TIMEOUT_MS: 15000,
-    JSZIP_CDN: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
-
     // ── Hidden photo gallery crawl ──────────────────────────────
     GALLERY_CRAWL_ENABLED: true,
     GALLERY_CRAWL_MAX_PHOTOS_PER_POST: 50,
     GALLERY_CRAWL_TIMEOUT_MS: 10000,
-    GALLERY_CRAWL_DELAY_MS: 800,
-    GALLERY_CRAWL_MAX_PAGES_PER_POST: 10,
+    GALLERY_CRAWL_DELAY_MS: 150,
+    GALLERY_CRAWL_MAX_PAGES_PER_POST: 30,
 
     // ── Carousel (interactive photo viewer) crawl ────────────
     CAROUSEL_CRAWL_ENABLED: false,         // Interactive viewer fallback (can lose feed state); prefer script-state extraction
-    CAROUSEL_SCRIPT_EXTRACT_ENABLED: true,  // Extract carousel photos from embedded JSON state in page scripts
+    CAROUSEL_SCRIPT_EXTRACT_ENABLED: false,  // General scan off by default; targeted multi-photo enrichment still runs
     CAROUSEL_CRAWL_MAX_PHOTOS: 100,        // Max images to capture per carousel session
     CAROUSEL_CRAWL_NAV_DELAY_MS: 600,      // Delay between carousel navigation steps
     CAROUSEL_CRAWL_OPEN_WAIT_MS: 1200,     // Wait for photo viewer overlay to appear after click
@@ -73,19 +75,11 @@
    */
   function parseIdsFromUrl(url) {
     const match = (url || window.location.href).match(
-      /\/groups\/(\d+)\/user\/(\d+)/
+      /\/groups\/(\d+)\/user\/(\d+)(?:[/?#]|$)/
     );
     if (!match) return null;
     return { groupId: match[1], userId: match[2] };
   }
-
-  const PAGE_IDS = parseIdsFromUrl();
-  if (!PAGE_IDS) {
-    console.log('[FB-Export] Not on a /groups/<gid>/user/<uid> page. Exiting.');
-    return;
-  }
-
-  const { groupId, userId } = PAGE_IDS;
 
   /* ────────── logging ────────── */
 
@@ -95,6 +89,17 @@
   function warn(...args) {
     console.warn('[FB-Export]', ...args);
   }
+
+  const PAGE_IDS = parseIdsFromUrl();
+  if (!PAGE_IDS) {
+    warn(
+      'Could not parse /groups/<gid>/user/<uid> from current URL:',
+      window.location.href
+    );
+  }
+
+  const groupId = PAGE_IDS ? PAGE_IDS.groupId : '';
+  const userId = PAGE_IDS ? PAGE_IDS.userId : '';
 
   /* ────────── URL helpers ────────── */
 
@@ -119,6 +124,70 @@
   }
 
   const photoFetchCandidatesByPath = new Map();
+
+  function isFacebookHost(hostname) {
+    const h = (hostname || '').toLowerCase();
+    return h === 'facebook.com' || h.endsWith('.facebook.com') || h === 'fb.com' || h.endsWith('.fb.com');
+  }
+
+  function normalizeExternalLinkHref(href) {
+    if (!href) return null;
+    try {
+      const u = new URL(href, window.location.origin);
+      const host = (u.hostname || '').toLowerCase();
+
+      if (isFacebookHost(host) && u.pathname === '/l.php') {
+        const target = u.searchParams.get('u');
+        if (!target) return null;
+        const decoded = new URL(decodeURIComponent(target));
+        decoded.searchParams.delete('fbclid');
+        return decoded.toString();
+      }
+
+      if (isFacebookHost(host)) return null;
+      if (!/^https?:$/i.test(u.protocol)) return null;
+
+      u.searchParams.delete('fbclid');
+      return u.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function extractExternalLinks(postEl) {
+    const seen = new Set();
+    const links = [];
+    for (const a of postEl.querySelectorAll('a[href]')) {
+      if (isInsideComment(a)) continue;
+      const normalized = normalizeExternalLinkHref(a.href || '');
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      links.push(normalized);
+    }
+    return links;
+  }
+
+  function isRequestedUserContextLink(href) {
+    if (!href) return false;
+    try {
+      const u = new URL(href, window.location.origin);
+      if (!isFacebookHost(u.hostname)) return false;
+      const path = u.pathname.replace(/\/+$/, '');
+      if (path === `/groups/${groupId}/user/${userId}`) return true;
+      if (path === '/profile.php' && u.searchParams.get('id') === userId) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  function isPostByRequestedUser(postEl) {
+    for (const a of postEl.querySelectorAll('a[href]')) {
+      if (isInsideComment(a)) continue;
+      if (isRequestedUserContextLink(a.href || '')) return true;
+    }
+    return false;
+  }
 
   /* ────────── permalink extraction ────────── */
 
@@ -146,14 +215,19 @@
       }
     }
 
-    // 2. Numeric post ID link under the group
+    // 2. Numeric post ID link under the group (strict path form only):
+    //    /groups/<gid>/<postId>/
     for (const a of candidateLinks) {
       const h = a.href;
-      if (
-        h.includes('/groups/' + groupId + '/') &&
-        /\/\d+\/?(\?|$)/.test(h)
-      ) {
-        return cleanUrl(h);
+      try {
+        const u = new URL(h);
+        const path = u.pathname.replace(/\/+$/, '');
+        const numericPath = new RegExp(`/groups/${groupId}/(\\d+)$`);
+        if (numericPath.test(path)) {
+          return cleanUrl(h);
+        }
+      } catch {
+        // Ignore malformed URLs.
       }
     }
 
@@ -406,6 +480,14 @@
     return url.includes('static.xx.fbcdn.net/rsrc.php') || url.startsWith('data:');
   }
 
+  function isExternalPreviewUrl(url) {
+    try {
+      return new URL(url).hostname.startsWith('external.');
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Upgrade a thumbnail URL to higher quality by stripping or replacing
    * the stp (size/transform) parameter.
@@ -497,6 +579,7 @@
     function add(url) {
       if (!url || !isFbCdnUrl(url)) return;
       if (isAvatarUrl(url) || isStaticAssetUrl(url)) return;
+      if (isExternalPreviewUrl(url)) return;
       if (isDecorativeBackground(url)) return;
       const preferred = registerPhotoFetchCandidates(url);
       const key = urlPathKey(preferred);
@@ -509,6 +592,8 @@
     const feedImgs = postEl.querySelectorAll('img[data-imgperflogname="feedImage"]');
     for (const img of feedImgs) {
       if (isInsideComment(img)) continue;
+      const outerLink = img.closest('a[href]');
+      if (outerLink && normalizeExternalLinkHref(outerLink.href || '')) continue;
       add(img.src);
       // Also check srcset for higher-res versions
       const srcset = img.getAttribute('srcset');
@@ -544,6 +629,8 @@
       if (isStaticAssetUrl(src)) continue;
       if (!isFbCdnUrl(src)) continue;
       if (isAvatarUrl(src)) continue;
+      const outerLink = img.closest('a[href]');
+      if (outerLink && normalizeExternalLinkHref(outerLink.href || '')) continue;
 
       const w = img.naturalWidth || parseInt(img.getAttribute('width'), 10) || 0;
       const h = img.naturalHeight || parseInt(img.getAttribute('height'), 10) || 0;
@@ -570,6 +657,8 @@
         /url\(["']?(https:\/\/[^"')]+(?:scontent|fbcdn)[^"')]+)["']?\)/
       );
       if (match && !isAvatarUrl(match[1]) && !isDecorativeBackground(match[1])) {
+        const outerLink = el.closest('a[href]');
+        if (outerLink && normalizeExternalLinkHref(outerLink.href || '')) continue;
         add(match[1]);
       }
     }
@@ -712,16 +801,29 @@
       }
     }
 
-    // Extract "next" photo links in the same set for pagination
-    // Pattern: /photo/?fbid=NNN&set=(gm|pcb|a).NNN (different fbid than current)
-    const nextPattern = /href="(\/photo\/?\?fbid=\d+[^"]*set=(?:gm|pcb|a)\.\d+[^"]*)"/g;
-    while ((match = nextPattern.exec(html)) !== null) {
-      let href = match[1].replace(/&amp;/g, '&');
+    const nextSet = new Set();
+    function addNextHref(rawHref) {
+      if (!rawHref) return;
+      let href = rawHref
+        .replace(/\\\//g, '/')
+        .replace(/\\u0026/g, '&')
+        .replace(/&amp;/g, '&');
+      if (!/\/photo\/\?fbid=\d+/.test(href) || !/set=(?:gm|pcb|a)\.\d+/.test(href)) return;
       if (!href.startsWith('http')) {
-        href = 'https://www.facebook.com' + href;
+        href = href.startsWith('/') ? `https://www.facebook.com${href}` : `https://www.facebook.com/${href}`;
       }
+      if (nextSet.has(href)) return;
+      nextSet.add(href);
       nextLinks.push(href);
     }
+
+    // Standard anchor href values.
+    const nextPattern = /href="(\/photo\/?\?fbid=\d+[^"]*set=(?:gm|pcb|a)\.\d+[^"]*)"/g;
+    while ((match = nextPattern.exec(html)) !== null) addNextHref(match[1]);
+
+    // JSON-embedded "next" links.
+    const nextJsonPattern = /"(?:next|next_url|story_attachment_url)"\s*:\s*"(\/photo\/\?fbid=\d+[^"]*set=(?:gm|pcb|a)\.\d+[^"]*)"/g;
+    while ((match = nextJsonPattern.exec(html)) !== null) addNextHref(match[1]);
 
     return { photos, nextLinks };
   }
@@ -733,10 +835,10 @@
    *
    * Returns an array of newly discovered photo URLs (not in existingUrls).
    */
-  async function resolveHiddenPhotos(postEl, existingUrls) {
+  async function resolveHiddenPhotos(postEl, existingUrls, galleryLinks) {
     if (!CONFIG.GALLERY_CRAWL_ENABLED) return [];
 
-    const galleryLinks = extractGalleryLinks(postEl);
+    if (!galleryLinks) return [];
     if (galleryLinks.length === 0) return [];
 
     const existingKeys = new Set(existingUrls.map(urlPathKey));
@@ -1479,6 +1581,9 @@
     scroll_hard_stop_idle_count: 0,
     scroll_hard_stop_dom_idle_count: 0,
     scroll_total_cycles: 0,
+    skipped_without_permalink: 0,
+    skipped_not_requested_user: 0,
+    posts_with_external_links: 0,
   };
 
   // Carousel control selection debug counters — included in validation summary
@@ -1495,6 +1600,40 @@
     recovered_after_pending: 0,
   };
 
+  function normalizeForKey(text) {
+    return (text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Build a stable per-post key for dedup across scan cycles.
+   * Never uses timestamps like Date.now() because that turns placeholders
+   * into endlessly "new" posts and can prevent EOF detection.
+   */
+  function buildPostKey(article, permalink, timestamp, text, inlinePhotos) {
+    if (permalink) return permalink;
+
+    const parts = [];
+    const normalizedText = normalizeForKey(text);
+    const photoSig = (inlinePhotos || []).slice(0, 3).map(urlPathKey).join('|');
+
+    if (timestamp) parts.push(`ts:${timestamp}`);
+    if (normalizedText) parts.push(`txt:${normalizedText.slice(0, 220)}`);
+    if (photoSig) parts.push(`img:${photoSig}`);
+
+    // Last-resort: any stable facebook post/photo-like href in this block.
+    if (parts.length === 0) {
+      const anchor = article.querySelector(
+        'a[href*="/groups/"][href*="/posts/"], a[href*="/permalink/"], a[href*="/photo/"][href*="fbid="]'
+      );
+      if (anchor && anchor.href) {
+        parts.push(`href:${cleanUrl(anchor.href)}`);
+      }
+    }
+
+    if (parts.length === 0) return null;
+    return `derived:${parts.join('||')}`;
+  }
+
   async function scanCurrentPosts() {
     const articles = findPostElements();
     extractionStats.discovery_method =
@@ -1508,21 +1647,46 @@
     let newCount = 0;
     for (const article of articles) {
       const permalink = extractPermalink(article);
-      const key = permalink || `no-link-${collectedPosts.size}-${Date.now()}`;
-      if (collectedPosts.has(key)) continue;
+      if (!permalink) {
+        extractionStats.skipped_without_permalink++;
+        continue;
+      }
+      if (!isPostByRequestedUser(article)) {
+        extractionStats.skipped_not_requested_user++;
+        continue;
+      }
 
       const text = extractText(article);
+      const externalLinks = extractExternalLinks(article);
+      const isLinkPost = externalLinks.length > 0;
       const inlinePhotos = extractPhotos(article);
       const timestamp = extractTimestamp(article);
+      const key = buildPostKey(article, permalink, timestamp, text, inlinePhotos);
 
-      // Attempt gallery crawl to discover hidden photos beyond visible thumbnails
-      const hiddenPhotos = await resolveHiddenPhotos(article, inlinePhotos);
+      // Skip empty virtualized placeholders / non-post blocks.
+      if (!key) continue;
+      if (collectedPosts.has(key)) continue;
 
-      // Extract carousel photos from embedded page state (preferred: no viewer,
-      // no navigation risk). Falls back to interactive viewer crawl if disabled.
+      // Attempt gallery crawl only on likely multi-photo posts.
+      const galleryLinks = extractGalleryLinks(article);
+      const shouldCrawlGallery =
+        galleryLinks.length > 0 &&
+        !isLinkPost &&
+        inlinePhotos.length < CONFIG.GALLERY_CRAWL_MAX_PHOTOS_PER_POST &&
+        (inlinePhotos.length > 0 || galleryLinks.some((l) => !!l.setId));
+      const hiddenPhotos = shouldCrawlGallery
+        ? await resolveHiddenPhotos(article, inlinePhotos, galleryLinks)
+        : [];
+
+      // Extract additional photo URLs from embedded page state for likely
+      // multi-photo posts only. This recovers >5 images without broad scans.
       const allKnownSoFar = [...inlinePhotos, ...hiddenPhotos];
       let carouselPhotos = [];
-      if (CONFIG.CAROUSEL_SCRIPT_EXTRACT_ENABLED) {
+      const shouldScriptEnrich =
+        !isLinkPost &&
+        inlinePhotos.length >= 5 &&
+        allKnownSoFar.length < CONFIG.MAX_PHOTOS_PER_POST;
+      if (CONFIG.CAROUSEL_SCRIPT_EXTRACT_ENABLED || shouldScriptEnrich) {
         carouselPhotos = extractCarouselFromScripts(article, allKnownSoFar);
         if (carouselPhotos.length > 0) {
           extractionStats.carousel_posts_crawled++;
@@ -1544,13 +1708,16 @@
           photos.push(url);
         }
       }
+      const finalPhotos = isLinkPost ? [] : photos;
 
       collectedPosts.set(key, {
-        permalink: permalink || '(no permalink found)',
+        permalink,
         timestamp: timestamp || '(no timestamp)',
         text,
-        photos,
-        image_urls: photos.length > 0 ? [...photos] : [],
+        post_type: isLinkPost ? 'link' : 'post',
+        external_links: externalLinks,
+        photos: finalPhotos,
+        image_urls: finalPhotos.length > 0 ? [...finalPhotos] : [],
         scraped_at: new Date().toISOString(),
       });
       newCount++;
@@ -1558,12 +1725,15 @@
       // Update stats
       extractionStats.posts_found = collectedPosts.size;
       if (text) extractionStats.posts_with_text++;
-      if (photos.length > 0) extractionStats.posts_with_images++;
-      extractionStats.total_images += photos.length;
+      if (finalPhotos.length > 0) extractionStats.posts_with_images++;
+      extractionStats.total_images += finalPhotos.length;
       if (permalink) extractionStats.posts_with_permalink++;
       if (timestamp) extractionStats.posts_with_timestamp++;
+      if (isLinkPost) extractionStats.posts_with_external_links++;
 
-      log(`Found post #${collectedPosts.size}: ${permalink || '(no link)'} [${photos.length} images (${hiddenPhotos.length} hidden, ${carouselPhotos.length} carousel), text=${text ? text.length + 'ch' : 'none'}]`);
+      log(
+        `Found post #${collectedPosts.size}: ${permalink} [type=${isLinkPost ? 'link' : 'post'}, images=${finalPhotos.length} (${hiddenPhotos.length} hidden, ${carouselPhotos.length} carousel), links=${externalLinks.length}, text=${text ? text.length + 'ch' : 'none'}]`
+      );
     }
     return newCount;
   }
@@ -1766,34 +1936,148 @@
     );
   }
 
-  /* ────────── JSZip loader ────────── */
+  /* ────────── ZIP writer (store/no compression) ────────── */
 
-  async function ensureJSZip() {
-    if (typeof JSZip !== 'undefined') return JSZip;
-    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.JSZip) {
-      return unsafeWindow.JSZip;
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  function dosDateTime(date) {
+    const year = Math.max(1980, date.getFullYear());
+    const dosTime =
+      (date.getHours() << 11) |
+      (date.getMinutes() << 5) |
+      Math.floor(date.getSeconds() / 2);
+    const dosDate =
+      ((year - 1980) << 9) |
+      ((date.getMonth() + 1) << 5) |
+      date.getDate();
+    return { dosTime, dosDate };
+  }
+
+  function writeU16(view, offset, value) {
+    view.setUint16(offset, value, true);
+  }
+
+  function writeU32(view, offset, value) {
+    view.setUint32(offset, value >>> 0, true);
+  }
+
+  class SimpleZip {
+    constructor() {
+      this.files = [];
+      this.encoder = new TextEncoder();
     }
 
-    log('JSZip not pre-loaded, attempting dynamic CDN load…');
-    return new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = CONFIG.JSZIP_CDN;
-      script.onload = () => {
-        const ref =
-          (typeof JSZip !== 'undefined' && JSZip) ||
-          (typeof unsafeWindow !== 'undefined' && unsafeWindow.JSZip) ||
-          null;
-        if (ref) {
-          log('JSZip loaded dynamically.');
-          resolve(ref);
-        } else {
-          reject(new Error('JSZip script loaded but constructor not found'));
-        }
-      };
-      script.onerror = () =>
-        reject(new Error('Failed to load JSZip from CDN'));
-      document.head.appendChild(script);
-    });
+    file(name, data) {
+      let bytes;
+      if (typeof data === 'string') {
+        bytes = this.encoder.encode(data);
+      } else if (data instanceof Uint8Array) {
+        bytes = data;
+      } else if (data instanceof ArrayBuffer) {
+        bytes = new Uint8Array(data);
+      } else {
+        bytes = new Uint8Array(data);
+      }
+      this.files.push({
+        name,
+        nameBytes: this.encoder.encode(name),
+        bytes,
+        crc: crc32(bytes),
+        date: new Date(),
+      });
+    }
+
+    async generateAsync(options) {
+      const chunks = [];
+      const central = [];
+      let offset = 0;
+
+      for (const file of this.files) {
+        const { dosTime, dosDate } = dosDateTime(file.date);
+        const local = new Uint8Array(30 + file.nameBytes.length);
+        const view = new DataView(local.buffer);
+        writeU32(view, 0, 0x04034b50);
+        writeU16(view, 4, 20);
+        writeU16(view, 6, 0x0800);
+        writeU16(view, 8, 0);
+        writeU16(view, 10, dosTime);
+        writeU16(view, 12, dosDate);
+        writeU32(view, 14, file.crc);
+        writeU32(view, 18, file.bytes.length);
+        writeU32(view, 22, file.bytes.length);
+        writeU16(view, 26, file.nameBytes.length);
+        writeU16(view, 28, 0);
+        local.set(file.nameBytes, 30);
+        chunks.push(local, file.bytes);
+
+        const centralHeader = new Uint8Array(46 + file.nameBytes.length);
+        const cv = new DataView(centralHeader.buffer);
+        writeU32(cv, 0, 0x02014b50);
+        writeU16(cv, 4, 20);
+        writeU16(cv, 6, 20);
+        writeU16(cv, 8, 0x0800);
+        writeU16(cv, 10, 0);
+        writeU16(cv, 12, dosTime);
+        writeU16(cv, 14, dosDate);
+        writeU32(cv, 16, file.crc);
+        writeU32(cv, 20, file.bytes.length);
+        writeU32(cv, 24, file.bytes.length);
+        writeU16(cv, 28, file.nameBytes.length);
+        writeU16(cv, 30, 0);
+        writeU16(cv, 32, 0);
+        writeU16(cv, 34, 0);
+        writeU16(cv, 36, 0);
+        writeU32(cv, 38, 0);
+        writeU32(cv, 42, offset);
+        centralHeader.set(file.nameBytes, 46);
+        central.push(centralHeader);
+
+        offset += local.length + file.bytes.length;
+      }
+
+      const centralOffset = offset;
+      let centralSize = 0;
+      for (const c of central) {
+        chunks.push(c);
+        centralSize += c.length;
+      }
+
+      const eocd = new Uint8Array(22);
+      const ev = new DataView(eocd.buffer);
+      writeU32(ev, 0, 0x06054b50);
+      writeU16(ev, 4, 0);
+      writeU16(ev, 6, 0);
+      writeU16(ev, 8, this.files.length);
+      writeU16(ev, 10, this.files.length);
+      writeU32(ev, 12, centralSize);
+      writeU32(ev, 16, centralOffset);
+      writeU16(ev, 20, 0);
+      chunks.push(eocd);
+
+      const blob = new Blob(chunks, { type: 'application/zip' });
+      if (options && options.type === 'uint8array') {
+        return new Uint8Array(await blob.arrayBuffer());
+      }
+      return blob;
+    }
   }
 
   /* ────────── image fetching ────────── */
@@ -1894,15 +2178,7 @@
   /* ────────── photo ZIP pipeline ────────── */
 
   async function buildPhotoZip(posts, statusFn) {
-    let JSZipRef;
-    try {
-      JSZipRef = await ensureJSZip();
-    } catch (e) {
-      warn('Could not load JSZip:', e.message);
-      return { zip: null, totalPhotos: 0, failures: [{ error: 'JSZip unavailable: ' + e.message }] };
-    }
-
-    const zip = new JSZipRef();
+    const zip = new SimpleZip();
     const failures = [];
     let totalPhotos = 0;
     let attemptedPhotos = 0;
@@ -1965,16 +2241,39 @@
   /* ────────── UI ────────── */
 
   let panelEl = null;
+  let panelHostEl = null;
   let statusEl = null;
 
+  function setImportantStyle(el, styles) {
+    for (const [key, value] of Object.entries(styles)) {
+      el.style.setProperty(key, value, 'important');
+    }
+  }
+
   function createPanel() {
+    const oldHost = document.getElementById('fb-export-panel-host');
+    if (oldHost) oldHost.remove();
+
+    panelHostEl = document.createElement('div');
+    panelHostEl.id = 'fb-export-panel-host';
+    setImportantStyle(panelHostEl, {
+      position: 'fixed',
+      right: '18px',
+      bottom: '18px',
+      'z-index': '2147483647',
+      display: 'block',
+      visibility: 'visible',
+      opacity: '1',
+      'pointer-events': 'auto',
+    });
+
+    const root = panelHostEl.attachShadow
+      ? panelHostEl.attachShadow({ mode: 'open' })
+      : panelHostEl;
+
     panelEl = document.createElement('div');
     panelEl.id = 'fb-export-panel';
     Object.assign(panelEl.style, {
-      position: 'fixed',
-      bottom: '20px',
-      right: '20px',
-      zIndex: '99999',
       background: '#1a1a2e',
       color: '#fff',
       padding: '14px 18px',
@@ -1987,11 +2286,14 @@
       display: 'flex',
       flexDirection: 'column',
       gap: '8px',
+      boxSizing: 'border-box',
     });
 
     // Title
     const title = document.createElement('div');
-    title.textContent = `Export: group ${groupId} / user ${userId}`;
+    title.textContent = PAGE_IDS
+      ? `Export: group ${groupId} / user ${userId}`
+      : 'FB Export: wrong page shape';
     Object.assign(title.style, {
       fontSize: '11px',
       opacity: '0.7',
@@ -2017,9 +2319,14 @@
       opacity: '0.8',
       minHeight: '16px',
     });
+    statusEl.textContent = PAGE_IDS
+      ? 'Ready.'
+      : 'Open a /groups/<groupId>/user/<userId>/ page.';
     panelEl.appendChild(statusEl);
 
-    document.body.appendChild(panelEl);
+    root.appendChild(panelEl);
+    (document.body || document.documentElement).appendChild(panelHostEl);
+    log('Export panel mounted.');
   }
 
   function makeButton(text, color, handler) {
@@ -2054,6 +2361,45 @@
     }
   }
 
+  function ensurePanelMounted() {
+    if (!document.body && !document.documentElement) return false;
+    const host = document.getElementById('fb-export-panel-host');
+    if (!host || !host.isConnected) {
+      createPanel();
+    }
+    return true;
+  }
+
+  function waitForBodyAndMountPanel() {
+    if (ensurePanelMounted()) return;
+    const timer = setInterval(() => {
+      if (ensurePanelMounted()) clearInterval(timer);
+    }, 250);
+  }
+
+  function registerMenuCommands() {
+    const register =
+      (typeof GM_registerMenuCommand === 'function' && GM_registerMenuCommand) ||
+      (typeof GM !== 'undefined' && typeof GM.registerMenuCommand === 'function' && GM.registerMenuCommand.bind(GM)) ||
+      null;
+    if (!register) {
+      warn('Tampermonkey menu command API is unavailable.');
+      return;
+    }
+    register('FB Export: Show panel', () => {
+      createPanel();
+      updateStatus('Ready.');
+    });
+    register('FB Export: Full Scan + Export', () => {
+      ensurePanelMounted();
+      handleFullScan();
+    });
+    register('FB Export: Export Loaded Now', () => {
+      ensurePanelMounted();
+      handleExportNow();
+    });
+  }
+
   /* ────────── export pipeline ────────── */
 
   let running = false;
@@ -2064,9 +2410,10 @@
     // Emit validation summary for every run (dry or real)
     const validation = {
       total_posts: total,
-      posts_with_permalink: posts.filter((p) => p.permalink && !p.permalink.startsWith('(no')).length,
+      posts_with_permalink: posts.filter((p) => !!p.permalink).length,
       posts_with_text: posts.filter((p) => p.text && p.text.length > 0).length,
       posts_with_photos: posts.filter((p) => p.photos && p.photos.length > 0).length,
+      posts_with_external_links: posts.filter((p) => (p.external_links || []).length > 0).length,
       total_photo_urls: posts.reduce((n, p) => n + (p.photos ? p.photos.length : 0), 0),
       unique_photo_urls: new Set(posts.flatMap((p) => (p.photos || []).map(urlPathKey))).size,
       duplicate_photo_urls_removed: posts.reduce((n, p) => n + (p.photos ? p.photos.length : 0), 0) - new Set(posts.flatMap((p) => (p.photos || []).map(urlPathKey))).size,
@@ -2130,6 +2477,10 @@
   }
 
   async function handleFullScan() {
+    if (!PAGE_IDS) {
+      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      return;
+    }
     if (running) return;
     running = true;
     setButtonsEnabled(false);
@@ -2154,6 +2505,10 @@
   }
 
   async function handleExportNow() {
+    if (!PAGE_IDS) {
+      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      return;
+    }
     if (running) return;
     running = true;
     setButtonsEnabled(false);
@@ -2173,6 +2528,11 @@
 
   /* ────────── init ────────── */
 
-  log(`Detected group=${groupId}, user=${userId}. Injecting export panel.`);
-  createPanel();
+  if (PAGE_IDS) {
+    log(`Detected group=${groupId}, user=${userId}. Injecting export panel.`);
+  } else {
+    warn('Injecting diagnostic panel without parsed IDs.');
+  }
+  registerMenuCommands();
+  waitForBodyAndMountPanel();
 })();
