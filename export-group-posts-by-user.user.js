@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.1.8
+// @version      4.1.10
 // @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
 // @author       Kenneth
 // @match        https://facebook.com/groups/*/user/*
@@ -32,6 +32,7 @@
     IDLE_THRESHOLD: 8,
     RETRY_BURSTS: 3,
     RETRY_BURST_WAIT_MS: 4000,
+    SCROLL_HEIGHT_GROWTH_EPSILON_PX: 120, // Ignore tiny scrollHeight jitter in FB SPA
 
     // ── End-of-feed detection ────────────────────────────────
     EOF_CONSECUTIVE_CYCLES: 3,       // All hard-stop signals must hold for this many cycles
@@ -39,6 +40,11 @@
     EOF_BOTTOM_PROBE_COUNT: 2,       // Stable-bottom probes per cycle
     EOF_BOTTOM_PROBE_WAIT_MS: 1200,  // Wait after forcing bottom before checking stability
     EOF_MIN_SCROLL_ATTEMPTS: 20,     // Guardrail: don't allow EOF stop to trigger too early in virtualized feeds
+    EOF_FINAL_SETTLE_PASSES: 2,      // Extra confirmation passes before declaring true EOF
+    EOF_FINAL_SETTLE_WAIT_MS: 2000,  // Wait per confirmation pass at page bottom
+    EOF_BOTTOM_NUDGE_PASSES: 2,      // Nudge up/down to trigger late loads before EOF
+    EOF_BOTTOM_NUDGE_UP_PX: 1400,    // Upward nudge amount before returning to bottom
+    EOF_BOTTOM_NUDGE_WAIT_MS: 1800,  // Wait after returning to bottom during nudge probes
 
     // ── Photo download ─────────────────────────────────────────
     DOWNLOAD_PHOTOS: true,
@@ -1906,22 +1912,37 @@
         window.scrollTo(0, beforeHeight);
         await sleep(CONFIG.EOF_BOTTOM_PROBE_WAIT_MS);
         const afterHeight = document.documentElement.scrollHeight;
-        if (!isAtBottom(10) || afterHeight > beforeHeight) return false;
+        if (!isAtBottom(10) || afterHeight > beforeHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX) return false;
       }
       return true;
     }
 
     while (attempts < CONFIG.MAX_SCROLL_ATTEMPTS) {
+      if (manualEndRequested) {
+        extractionStats.end_of_feed_detected = true;
+        extractionStats.end_of_feed_reason = 'manual_end_requested';
+        statusFn(`Manual end requested — ${collectedPosts.size} posts`);
+        log('Manual end requested via panel button. Stopping scroll loop.');
+        break;
+      }
+
       attempts++;
       extractionStats.scroll_total_cycles = attempts;
       window.scrollBy(0, CONFIG.SCROLL_STEP_PX);
       await sleep(CONFIG.SCROLL_INTERVAL_MS);
 
       await scanCurrentPosts();
+      if (manualEndRequested) {
+        extractionStats.end_of_feed_detected = true;
+        extractionStats.end_of_feed_reason = 'manual_end_requested';
+        statusFn(`Manual end requested — ${collectedPosts.size} posts`);
+        log('Manual end requested after scan cycle. Stopping scroll loop.');
+        break;
+      }
 
       const currHeight = document.documentElement.scrollHeight;
       const currSize = collectedPosts.size;
-      const heightGrew = currHeight > prevHeight;
+      const heightGrew = currHeight > prevHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX;
       const postsGrew = currSize > prevSize;
 
       if (!heightGrew && !postsGrew) {
@@ -1961,7 +1982,7 @@
         const noPostGrowth = currSize === prevSize;
 
         // Signal 2: no scrollHeight increase (already tracked by idleCount)
-        const noHeightGrowth = currHeight <= prevHeight;
+        const noHeightGrowth = currHeight <= prevHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX;
 
         // Signal 3: viewport at bottom and bottom is stable (no late height growth)
         const atBottom = await confirmStableBottom();
@@ -1995,6 +2016,67 @@
 
         // Hard stop: all signals held for enough consecutive cycles
         if (eofCycleCount >= CONFIG.EOF_CONSECUTIVE_CYCLES) {
+          // Final anti-false-positive settle checks: stay pinned at bottom,
+          // wait for late async loads, rescan, and ensure no growth occurs.
+          let settleConfirmed = true;
+          for (let pass = 1; pass <= CONFIG.EOF_FINAL_SETTLE_PASSES; pass++) {
+            const beforeSize = collectedPosts.size;
+            const beforeHeight = document.documentElement.scrollHeight;
+            window.scrollTo(0, beforeHeight);
+            await sleep(CONFIG.EOF_FINAL_SETTLE_WAIT_MS);
+            await scanCurrentPosts();
+            const afterSize = collectedPosts.size;
+            const afterHeight = document.documentElement.scrollHeight;
+            if (afterSize > beforeSize || afterHeight > beforeHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX) {
+              settleConfirmed = false;
+              log(
+                `EOF final settle pass ${pass}/${CONFIG.EOF_FINAL_SETTLE_PASSES} found late growth (+${afterSize - beforeSize} posts, +${afterHeight - beforeHeight}px). Continuing scroll.`
+              );
+              idleCount = 0;
+              eofCycleCount = 0;
+              tailSigRepeatCount = 0;
+              prevSize = afterSize;
+              prevHeight = afterHeight;
+              lastPostCount = afterSize;
+              lastDomNodeCount = findPostElements().length;
+              zeroNewPostCycles = 0;
+              break;
+            }
+          }
+          if (!settleConfirmed) continue;
+
+          // Final nudge probes: move up then back to bottom to trigger late
+          // loader fetches that don't start from a static pinned-bottom state.
+          let nudgeConfirmed = true;
+          for (let pass = 1; pass <= CONFIG.EOF_BOTTOM_NUDGE_PASSES; pass++) {
+            const beforeSize = collectedPosts.size;
+            const beforeHeight = document.documentElement.scrollHeight;
+            const nudgeUp = Math.max(CONFIG.EOF_BOTTOM_NUDGE_UP_PX, Math.floor(window.innerHeight * 1.2));
+            window.scrollBy(0, -nudgeUp);
+            await sleep(700);
+            window.scrollTo(0, document.documentElement.scrollHeight);
+            await sleep(CONFIG.EOF_BOTTOM_NUDGE_WAIT_MS);
+            await scanCurrentPosts();
+            const afterSize = collectedPosts.size;
+            const afterHeight = document.documentElement.scrollHeight;
+            if (afterSize > beforeSize || afterHeight > beforeHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX) {
+              nudgeConfirmed = false;
+              log(
+                `EOF nudge pass ${pass}/${CONFIG.EOF_BOTTOM_NUDGE_PASSES} found late growth (+${afterSize - beforeSize} posts, +${afterHeight - beforeHeight}px). Continuing scroll.`
+              );
+              idleCount = 0;
+              eofCycleCount = 0;
+              tailSigRepeatCount = 0;
+              prevSize = afterSize;
+              prevHeight = afterHeight;
+              lastPostCount = afterSize;
+              lastDomNodeCount = findPostElements().length;
+              zeroNewPostCycles = 0;
+              break;
+            }
+          }
+          if (!nudgeConfirmed) continue;
+
           const reasons = [
             `min_attempts_${attempts}`,
             'retries_exhausted',
@@ -2027,7 +2109,7 @@
           const afterHeight = document.documentElement.scrollHeight;
           const afterSize = collectedPosts.size;
 
-          if (afterHeight > prevHeight || afterSize > prevSize) {
+          if (afterHeight > prevHeight + CONFIG.SCROLL_HEIGHT_GROWTH_EPSILON_PX || afterSize > prevSize) {
             log('Retry burst found new content — resuming normal scroll.');
             idleCount = 0;
             eofCycleCount = 0;
@@ -2369,6 +2451,12 @@
   let panelEl = null;
   let panelHostEl = null;
   let statusEl = null;
+  let fullScanBtn = null;
+  let exportNowBtn = null;
+  let manualEndExportBtn = null;
+  let reviewActionsEl = null;
+  let downloadAfterReviewBtn = null;
+  let continueScanBtn = null;
 
   function setImportantStyle(el, styles) {
     for (const [key, value] of Object.entries(styles)) {
@@ -2428,14 +2516,20 @@
     panelEl.appendChild(title);
 
     // Full Scan + Export button
-    const fullBtn = makeButton('Full Scan + Export', '#1877f2', handleFullScan);
-    fullBtn.id = 'fb-export-full-btn';
-    panelEl.appendChild(fullBtn);
+    fullScanBtn = makeButton('Full Scan + Export', '#1877f2', handleFullScan);
+    fullScanBtn.id = 'fb-export-full-btn';
+    panelEl.appendChild(fullScanBtn);
 
     // Export Loaded Now button
-    const nowBtn = makeButton('Export Loaded Now', '#42b72a', handleExportNow);
-    nowBtn.id = 'fb-export-now-btn';
-    panelEl.appendChild(nowBtn);
+    exportNowBtn = makeButton('Export Loaded Now', '#42b72a', handleExportNow);
+    exportNowBtn.id = 'fb-export-now-btn';
+    panelEl.appendChild(exportNowBtn);
+
+    // Manual override shown only while scan is running.
+    manualEndExportBtn = makeButton('End reached -- export', '#d35400', handleManualEndExport);
+    manualEndExportBtn.id = 'fb-export-manual-end-btn';
+    manualEndExportBtn.style.display = 'none';
+    panelEl.appendChild(manualEndExportBtn);
 
     // Status line
     statusEl = document.createElement('div');
@@ -2449,6 +2543,25 @@
       ? 'Ready.'
       : 'Open a /groups/<groupId>/user/<userId>/ page.';
     panelEl.appendChild(statusEl);
+
+    // Manual review actions shown only after end-of-feed detection.
+    reviewActionsEl = document.createElement('div');
+    reviewActionsEl.id = 'fb-export-review-actions';
+    Object.assign(reviewActionsEl.style, {
+      display: 'none',
+      gridTemplateColumns: '1fr 1fr',
+      gap: '8px',
+    });
+
+    downloadAfterReviewBtn = makeButton('Download ZIP', '#4267b2', handleDownloadAfterReview);
+    downloadAfterReviewBtn.id = 'fb-export-download-review-btn';
+
+    continueScanBtn = makeButton('Not at End: Continue for manual evaluation', '#f39c12', handleContinueAfterReview);
+    continueScanBtn.id = 'fb-export-continue-review-btn';
+
+    reviewActionsEl.appendChild(downloadAfterReviewBtn);
+    reviewActionsEl.appendChild(continueScanBtn);
+    panelEl.appendChild(reviewActionsEl);
 
     root.appendChild(panelEl);
     (document.body || document.documentElement).appendChild(panelHostEl);
@@ -2480,7 +2593,31 @@
   }
 
   function setButtonsEnabled(enabled) {
-    const btns = panelEl ? panelEl.querySelectorAll('#fb-export-full-btn, #fb-export-now-btn') : [];
+    const mainBtns = [fullScanBtn, exportNowBtn].filter(Boolean);
+    const manualBtn = manualEndExportBtn;
+
+    for (const btn of mainBtns) {
+      btn.style.display = enabled ? 'block' : 'none';
+      btn.style.opacity = enabled ? '1' : '0.5';
+      btn.style.pointerEvents = enabled ? 'auto' : 'none';
+    }
+    if (manualBtn) {
+      const showManual = !enabled && manualEndButtonMode;
+      manualBtn.style.display = showManual ? 'block' : 'none';
+      manualBtn.style.opacity = '1';
+      manualBtn.style.pointerEvents = showManual ? 'auto' : 'none';
+    }
+  }
+
+  function setReviewActionsVisible(visible) {
+    if (!reviewActionsEl) return;
+    reviewActionsEl.style.display = visible ? 'grid' : 'none';
+  }
+
+  function setReviewActionsEnabled(enabled) {
+    const btns = panelEl
+      ? panelEl.querySelectorAll('#fb-export-download-review-btn, #fb-export-continue-review-btn')
+      : [];
     for (const btn of btns) {
       btn.style.opacity = enabled ? '1' : '0.5';
       btn.style.pointerEvents = enabled ? 'auto' : 'none';
@@ -2529,6 +2666,22 @@
   /* ────────── export pipeline ────────── */
 
   let running = false;
+  let pendingReviewPosts = null;
+  let manualEndRequested = false;
+  let manualEndExportRequested = false;
+  let manualEndButtonMode = false;
+
+  async function handleManualEndExport() {
+    if (!running || !manualEndButtonMode) return;
+    manualEndRequested = true;
+    manualEndExportRequested = true;
+    if (manualEndExportBtn) {
+      manualEndExportBtn.style.opacity = '0.6';
+      manualEndExportBtn.style.pointerEvents = 'none';
+      manualEndExportBtn.textContent = 'Finalizing export...';
+    }
+    updateStatus('Manual end requested. Finalizing export…');
+  }
 
   async function runExport(posts) {
     const total = posts.length;
@@ -2591,6 +2744,73 @@
     }
   }
 
+  async function handleDownloadAfterReview() {
+    if (running) return;
+    if (!pendingReviewPosts || pendingReviewPosts.length === 0) {
+      updateStatus('Nothing queued. Run Full Scan first.');
+      return;
+    }
+    running = true;
+    manualEndButtonMode = false;
+    setButtonsEnabled(false);
+    setReviewActionsEnabled(false);
+    try {
+      await runExport(pendingReviewPosts);
+      setReviewActionsVisible(false);
+      pendingReviewPosts = null;
+    } finally {
+      running = false;
+      manualEndButtonMode = false;
+      setButtonsEnabled(true);
+      setReviewActionsEnabled(true);
+    }
+  }
+
+  async function handleContinueAfterReview() {
+    if (running) return;
+    if (!PAGE_IDS) {
+      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      return;
+    }
+    running = true;
+    manualEndRequested = false;
+    manualEndExportRequested = false;
+    manualEndButtonMode = true;
+    setButtonsEnabled(false);
+    setReviewActionsEnabled(false);
+    setReviewActionsVisible(false);
+    extractionStats.end_of_feed_detected = false;
+    extractionStats.end_of_feed_reason = '';
+    try {
+      updateStatus(`Continuing scan… ${collectedPosts.size} posts so far`);
+      await autoScroll(updateStatus);
+      await scanCurrentPosts();
+      const posts = [...collectedPosts.values()];
+      log(`Continue scan pause. Total posts: ${posts.length}`);
+      pendingReviewPosts = posts;
+      if (manualEndExportRequested) {
+        await runExport(posts);
+        pendingReviewPosts = null;
+        setReviewActionsVisible(false);
+      } else
+      if (extractionStats.end_of_feed_detected) {
+        updateStatus('End of feed detected. Review page, then choose Download ZIP or Continue.');
+        setReviewActionsVisible(true);
+        alert('End of feed detected');
+      } else {
+        updateStatus(`Continue pass done. ${posts.length} posts loaded.`);
+      }
+    } finally {
+      running = false;
+      manualEndRequested = false;
+      manualEndExportRequested = false;
+      manualEndButtonMode = false;
+      setButtonsEnabled(true);
+      if (manualEndExportBtn) manualEndExportBtn.textContent = 'End reached -- export';
+      setReviewActionsEnabled(true);
+    }
+  }
+
   async function handleFullScan() {
     if (!PAGE_IDS) {
       updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
@@ -2598,7 +2818,12 @@
     }
     if (running) return;
     running = true;
+    manualEndRequested = false;
+    manualEndExportRequested = false;
+    manualEndButtonMode = true;
     setButtonsEnabled(false);
+    setReviewActionsVisible(false);
+    pendingReviewPosts = null;
 
     log('Full Scan + Export. Group:', groupId, 'User:', userId);
     await ensureGroupPostsSurface();
@@ -2614,10 +2839,26 @@
     const posts = [...collectedPosts.values()];
     log(`Done scrolling. Total posts: ${posts.length}`);
 
-    await runExport(posts);
+    pendingReviewPosts = posts;
+    if (manualEndExportRequested) {
+      await runExport(posts);
+      pendingReviewPosts = null;
+      setReviewActionsVisible(false);
+    } else if (extractionStats.end_of_feed_detected) {
+      updateStatus('End of feed detected. Review page, then choose Download ZIP or Continue.');
+      setReviewActionsVisible(true);
+      alert('End of feed detected');
+    } else {
+      await runExport(posts);
+    }
 
     running = false;
+    manualEndRequested = false;
+    manualEndExportRequested = false;
+    manualEndButtonMode = false;
     setButtonsEnabled(true);
+    if (manualEndExportBtn) manualEndExportBtn.textContent = 'End reached -- export';
+    setReviewActionsEnabled(true);
   }
 
   async function handleExportNow() {
@@ -2627,6 +2868,9 @@
     }
     if (running) return;
     running = true;
+    manualEndRequested = false;
+    manualEndExportRequested = false;
+    manualEndButtonMode = false;
     setButtonsEnabled(false);
 
     log('Export Loaded Now. Group:', groupId, 'User:', userId);
@@ -2640,7 +2884,11 @@
     await runExport(posts);
 
     running = false;
+    manualEndRequested = false;
+    manualEndExportRequested = false;
+    manualEndButtonMode = false;
     setButtonsEnabled(true);
+    if (manualEndExportBtn) manualEndExportBtn.textContent = 'End reached -- export';
   }
 
   /* ────────── init ────────── */
