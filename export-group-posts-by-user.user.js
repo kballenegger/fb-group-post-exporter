@@ -1,17 +1,23 @@
 // ==UserScript==
 // @name         FB Group Posts Export by User
 // @namespace    https://github.com/kenneth-bot/klaw-workspace
-// @version      4.1.10
-// @description  Export posts from a Facebook group user page (/groups/<gid>/user/<uid>) as JSON + photo ZIP. URL-driven, no hardcoded IDs.
+// @version      4.2.0
+// @description  Export posts from a Facebook group (all members on /groups/<gid>/, or one user on /groups/<gid>/user/<uid>) as JSON + photo ZIP, including every carousel photo. URL-driven, no hardcoded IDs.
 // @author       Kenneth
 // @match        https://facebook.com/groups/*/user/*
 // @match        https://www.facebook.com/groups/*/user/*
 // @match        https://web.facebook.com/groups/*/user/*
+// @match        https://facebook.com/groups/*
+// @match        https://www.facebook.com/groups/*
+// @match        https://web.facebook.com/groups/*
 // @include      /^https:\/\/(www\.|web\.)?facebook\.com\/groups\/\d+\/user\/\d+\/?.*/
+// @include      /^https:\/\/(www\.|web\.)?facebook\.com\/groups\/\d+\/?[\?#]?.*/
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      fbcdn.net
 // @connect      *.fbcdn.net
+// @connect      scontent.fbcdn.net
+// @connect      scontent-*.fbcdn.net
 // @connect      www.facebook.com
 // @run-at       document-idle
 // ==/UserScript==
@@ -51,6 +57,11 @@
     MAX_PHOTOS_PER_POST: 50,
     MAX_TOTAL_PHOTOS: 500,
     PHOTO_FETCH_TIMEOUT_MS: 15000,
+    // Fetch photos while scanning instead of waiting until the end of a long
+    // scan. scontent*.fbcdn.net URLs are signed and can expire during a long
+    // full scan; fetching close to extraction time keeps the URLs fresh.
+    PREFETCH_PHOTOS_DURING_SCAN: true,
+    PREFETCH_MAX_CONCURRENCY: 6,
     // ── Hidden photo gallery crawl ──────────────────────────────
     GALLERY_CRAWL_ENABLED: true,
     GALLERY_CRAWL_MAX_PHOTOS_PER_POST: 50,
@@ -59,9 +70,14 @@
     GALLERY_CRAWL_MAX_PAGES_PER_POST: 30,
 
     // ── Carousel (interactive photo viewer) crawl ────────────
-    CAROUSEL_CRAWL_ENABLED: false,         // Broad interactive viewer fallback; targeted capped-photo recovery uses the setting below
+    // Full carousel extraction is a hard requirement. All three strategies
+    // are enabled: script-state extraction recovers every uri in the post's
+    // embedded JSON (captures hidden photos), the capped-photo-grid viewer
+    // crawl opens "+N" tiles to recover anything the script state missed,
+    // and the broad interactive viewer crawl acts as a last-resort fallback.
+    CAROUSEL_CRAWL_ENABLED: true,          // Broad interactive viewer fallback (last resort)
     CAROUSEL_CRAWL_TARGETED_CAPS_ENABLED: true, // Open only +N/capped photo grids to recover hidden photos
-    CAROUSEL_SCRIPT_EXTRACT_ENABLED: false,  // General scan off by default; targeted multi-photo enrichment still runs
+    CAROUSEL_SCRIPT_EXTRACT_ENABLED: true,  // Recover every uri in embedded script state
     CAROUSEL_CRAWL_MAX_PHOTOS: 100,        // Max images to capture per carousel session
     CAROUSEL_CRAWL_NAV_DELAY_MS: 600,      // Delay between carousel navigation steps
     CAROUSEL_CRAWL_OPEN_WAIT_MS: 1200,     // Wait for photo viewer overlay to appear after click
@@ -77,16 +93,21 @@
   /* ────────── URL parsing ────────── */
 
   /**
-   * Parse group ID and user ID from the current URL.
-   * Expected pattern: /groups/<groupId>/user/<userId>/...
-   * Returns { groupId, userId } or null.
+   * Parse group ID (and optionally a user ID) from the current URL.
+   * Expected patterns:
+   *   - Specific user: /groups/<groupId>/user/<userId>/...
+   *   - All members:  /groups/<groupId>/...
+   * Returns { groupId, userId } (userId empty in all-members mode) or null.
    */
   function parseIdsFromUrl(url) {
-    const match = (url || window.location.href).match(
-      /\/groups\/(\d+)\/user\/(\d+)(?:[/?#]|$)/
-    );
-    if (!match) return null;
-    return { groupId: match[1], userId: match[2] };
+    const href = url || window.location.href;
+    // Specific-user page wins first (most specific shape).
+    const userMatch = href.match(/\/groups\/([^/?#]+)\/user\/(\d+)(?:[/?#]|$)/);
+    if (userMatch) return { groupId: userMatch[1], userId: userMatch[2] };
+    // Otherwise a bare group page — all-members mode.
+    const groupMatch = href.match(/\/groups\/([^/?#]+)(?:[/?#]|$)/);
+    if (groupMatch) return { groupId: groupMatch[1], userId: '' };
+    return null;
   }
 
   /* ────────── logging ────────── */
@@ -101,13 +122,19 @@
   const PAGE_IDS = parseIdsFromUrl();
   if (!PAGE_IDS) {
     warn(
-      'Could not parse /groups/<gid>/user/<uid> from current URL:',
+      'Could not parse a /groups/<gid>[/user/<uid>] URL from current location:',
       window.location.href
     );
   }
 
   const groupId = PAGE_IDS ? PAGE_IDS.groupId : '';
   const userId = PAGE_IDS ? PAGE_IDS.userId : '';
+  // In all-members mode (no /user/<uid> in the URL) we export every member's
+  // posts. In specific-user mode we filter to only the requested member.
+  const SPECIFIC_USER_MODE = !!userId;
+  const EXPORT_PREFIX = SPECIFIC_USER_MODE
+    ? `fb-export-${groupId}-user-${userId}`
+    : `fb-export-${groupId}`;
 
   /* ────────── URL helpers ────────── */
 
@@ -1651,6 +1678,10 @@
     see_more_expanded: 0,
     hidden_photos_discovered: 0,
     hidden_photo_fetch_failures: 0,
+    photo_prefetch_total: 0,
+    photo_prefetch_success: 0,
+    photo_prefetch_failed: 0,
+    photo_prefetch_fallback_used: 0,
     carousel_posts_crawled: 0,
     carousel_photos_captured: 0,
     carousel_nav_steps: 0,
@@ -1735,7 +1766,7 @@
         extractionStats.skipped_without_permalink++;
         continue;
       }
-      if (!isPostByRequestedUser(article)) {
+      if (SPECIFIC_USER_MODE && !isPostByRequestedUser(article)) {
         extractionStats.skipped_not_requested_user++;
         continue;
       }
@@ -1801,6 +1832,12 @@
         }
       }
       const finalPhotos = isLinkPost ? [] : photos;
+
+      // Prefetch photo bytes now, while the signed URLs are still fresh.
+      // Only post photos are downloaded (link previews are excluded above).
+      if (finalPhotos.length > 0) {
+        for (const photoUrl of finalPhotos) queuePhotoPrefetch(photoUrl);
+      }
 
       collectedPosts.set(key, {
         permalink,
@@ -2288,27 +2325,34 @@
 
   function fetchImageAsArrayBuffer(url) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: url,
-        responseType: 'arraybuffer',
-        headers: {
-          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-          Referer: 'https://www.facebook.com/',
-          Origin: 'https://www.facebook.com',
-        },
-        anonymous: false,
-        timeout: CONFIG.PHOTO_FETCH_TIMEOUT_MS,
-        onload: (resp) => {
-          if (resp.status >= 200 && resp.status < 300) {
-            resolve(resp.response);
-          } else {
-            reject(new Error(`HTTP ${resp.status}`));
-          }
-        },
-        onerror: () => reject(new Error('Network error')),
-        ontimeout: () => reject(new Error('Timeout')),
-      });
+      function attempt(retriesLeft) {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: url,
+          responseType: 'arraybuffer',
+          headers: {
+            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            Referer: 'https://www.facebook.com/',
+            Origin: 'https://www.facebook.com',
+          },
+          anonymous: false,
+          timeout: CONFIG.PHOTO_FETCH_TIMEOUT_MS,
+          onload: (resp) => {
+            if (resp.status >= 200 && resp.status < 300) {
+              resolve(resp.response);
+            } else if ((resp.status === 403 || resp.status >= 500) && retriesLeft > 0) {
+              // Transient CDN rejection — retry briefly before falling back.
+              log(`Photo fetch HTTP ${resp.status} for ${url} — retrying (${retriesLeft} left).`);
+              setTimeout(() => attempt(retriesLeft - 1), 800);
+            } else {
+              reject(new Error(`HTTP ${resp.status}`));
+            }
+          },
+          onerror: () => reject(new Error('Network error')),
+          ontimeout: () => reject(new Error('Timeout')),
+        });
+      }
+      attempt(1);
     });
   }
 
@@ -2337,6 +2381,74 @@
     throw lastError || new Error('Unknown photo fetch failure');
   }
 
+  // ── photo prefetch during scan ──────────────────────────────────
+  //
+  // scontent*.fbcdn.net URLs are signed and expire. A long full scan can
+  // leave early-post URLs stale by the time the export loop reaches them,
+  // which shows up as a wall of HTTP 403s. So we fetch photo bytes promptly
+  // (right after extraction, URL still fresh) and cache them for the export
+  // phase. Successes are cached; failures are not, so a transient error at
+  // prefetch time still gets retried during the export phase.
+
+  const prefetchedPhotoBodies = new Map(); // urlPathKey -> Uint8Array
+  const pendingPrefetchKeys = new Set();
+  const prefetchQueue = [];
+  let activePrefetches = 0;
+
+  function pumpPrefetchQueue() {
+    while (
+      prefetchQueue.length > 0 &&
+      activePrefetches < CONFIG.PREFETCH_MAX_CONCURRENCY &&
+      prefetchedPhotoBodies.size < CONFIG.MAX_TOTAL_PHOTOS
+    ) {
+      const url = prefetchQueue.shift();
+      const key = urlPathKey(url);
+      if (prefetchedPhotoBodies.has(key) || pendingPrefetchKeys.has(key)) continue;
+      pendingPrefetchKeys.add(key);
+      activePrefetches++;
+      extractionStats.photo_prefetch_total++;
+      fetchImageWithFallback(url)
+        .then(({ buffer, attempts }) => {
+          if (buffer) {
+            prefetchedPhotoBodies.set(key, buffer);
+            extractionStats.photo_prefetch_success++;
+            if (attempts > 1) extractionStats.photo_prefetch_fallback_used++;
+          }
+        })
+        .catch((e) => {
+          // Deliberately not cached — the export phase retries the fetch.
+          log(`Prefetch failed (will retry at export): ${e.message}`);
+          extractionStats.photo_prefetch_failed++;
+        })
+        .finally(() => {
+          pendingPrefetchKeys.delete(key);
+          activePrefetches--;
+          pumpPrefetchQueue();
+        });
+    }
+  }
+
+  function queuePhotoPrefetch(url) {
+    if (!CONFIG.PREFETCH_PHOTOS_DURING_SCAN || !CONFIG.DOWNLOAD_PHOTOS) return;
+    if (!url) return;
+    if (prefetchedPhotoBodies.size >= CONFIG.MAX_TOTAL_PHOTOS) return;
+    const key = urlPathKey(url);
+    if (prefetchedPhotoBodies.has(key) || pendingPrefetchKeys.has(key)) return;
+    prefetchQueue.push(url);
+    pumpPrefetchQueue();
+  }
+
+  async function waitForPrefetches(statusFn) {
+    if (!CONFIG.PREFETCH_PHOTOS_DURING_SCAN || !CONFIG.DOWNLOAD_PHOTOS) return;
+    while (
+      activePrefetches > 0 ||
+      (prefetchQueue.length > 0 && prefetchedPhotoBodies.size < CONFIG.MAX_TOTAL_PHOTOS)
+    ) {
+      statusFn(`Finishing fresh photo downloads… ${prefetchedPhotoBodies.size} cached`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
   function guessExtension(url) {
     const match = url.match(/\.(jpe?g|png|webp|gif)/i);
     if (match) return match[1].toLowerCase().replace('jpeg', 'jpg');
@@ -2362,7 +2474,8 @@
     return {
       meta: {
         group_id: groupId,
-        user_id: userId,
+        user_id: userId, // empty string in all-members mode
+        export_mode: SPECIFIC_USER_MODE ? 'specific_user' : 'all_members',
         exported_at: new Date().toISOString(),
         post_count: posts.length,
         extraction_stats: { ...extractionStats },
@@ -2413,7 +2526,18 @@
           );
 
           try {
-            const { buffer, attempts } = await fetchImageWithFallback(photoUrl);
+            // Serve from the prefetch cache first (fresh URLs, already
+            // downloaded during scan). Only go to the network on a miss.
+            let buffer, attempts;
+            const cached = prefetchedPhotoBodies.get(urlPathKey(photoUrl));
+            if (cached) {
+              buffer = cached;
+              attempts = 1;
+            } else {
+              const result = await fetchImageWithFallback(photoUrl);
+              buffer = result.buffer;
+              attempts = result.attempts;
+            }
             zip.file(filename, buffer);
             exportPosts[i].photos.push(filename);
             exportPosts[i].image_urls.push(filename);
@@ -2506,7 +2630,9 @@
     // Title
     const title = document.createElement('div');
     title.textContent = PAGE_IDS
-      ? `Export: group ${groupId} / user ${userId}`
+      ? (SPECIFIC_USER_MODE
+        ? `Export: group ${groupId} / user ${userId}`
+        : `Export group ${groupId} (all members)`)
       : 'FB Export: wrong page shape';
     Object.assign(title.style, {
       fontSize: '11px',
@@ -2541,7 +2667,7 @@
     });
     statusEl.textContent = PAGE_IDS
       ? 'Ready.'
-      : 'Open a /groups/<groupId>/user/<userId>/ page.';
+      : 'Open a /groups/<groupId>/ page.';
     panelEl.appendChild(statusEl);
 
     // Manual review actions shown only after end-of-feed detection.
@@ -2722,6 +2848,7 @@
       : 'photo download disabled';
     updateStatus(`Building export ZIP (${photoStatus})…`);
 
+    await waitForPrefetches(updateStatus);
     const result = await buildExportZip(posts, updateStatus);
 
     updateStatus('Generating ZIP file…');
@@ -2729,7 +2856,7 @@
       const content = await result.zip.generateAsync({ type: 'blob' });
       downloadBlob(
         content,
-        `fb-export-${groupId}-user-${userId}-${Date.now()}.zip`
+        `${EXPORT_PREFIX}-${Date.now()}.zip`
       );
       const failMsg =
         result.failures.length > 0
@@ -2769,7 +2896,7 @@
   async function handleContinueAfterReview() {
     if (running) return;
     if (!PAGE_IDS) {
-      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      updateStatus('Wrong page. Need a /groups/<groupId>/ page.');
       return;
     }
     running = true;
@@ -2813,7 +2940,7 @@
 
   async function handleFullScan() {
     if (!PAGE_IDS) {
-      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      updateStatus('Wrong page. Need a /groups/<groupId>/ page.');
       return;
     }
     if (running) return;
@@ -2863,7 +2990,7 @@
 
   async function handleExportNow() {
     if (!PAGE_IDS) {
-      updateStatus('Wrong page. Need /groups/<groupId>/user/<userId>/.');
+      updateStatus('Wrong page. Need a /groups/<groupId>/ page.');
       return;
     }
     if (running) return;

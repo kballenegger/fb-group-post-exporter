@@ -1,13 +1,18 @@
 # FB Group Posts Export by User
 
-A Tampermonkey userscript for exporting your own posts from a single Facebook
-group as a ZIP containing JSON plus downloaded photos.
+A Tampermonkey userscript for exporting posts from a single Facebook group as
+a ZIP containing JSON plus downloaded photos.
 
-The script is strictly URL-driven — it only runs on
-`https://www.facebook.com/groups/<gid>/user/<uid>/` pages, which are the
-per-member-in-group views Facebook already shows you. It reads what's
-rendered in your own logged-in browser session and saves it locally. Nothing
-is uploaded anywhere.
+The script is strictly URL-driven. It runs in two modes:
+
+- **Specific user** — `https://www.facebook.com/groups/<gid>/user/<uid>/`
+  (the per-member-in-group view Facebook already shows you). Exports only
+  that member's posts.
+- **All members** — `https://www.facebook.com/groups/<gid>/` (the general
+  group feed). Exports every member's posts.
+
+It reads what's rendered in your own logged-in browser session and saves it
+locally. Nothing is uploaded anywhere.
 
 ## Requirements
 
@@ -32,25 +37,29 @@ network-loaded ZIP dependency when running through Tampermonkey.
 ## Use
 
 1. In your logged-in browser, visit the group you want to export from.
-2. Click your own name/avatar to open the group's **"Your activity"** /
-   member view. The URL should look like:
+2. Either open the general group feed (`https://www.facebook.com/groups/<gid>/`)
+   to export posts from **all members**, or click your own name/avatar to open
+   the group's **"Your activity"** / member view for a **specific user**:
 
    ```
    https://www.facebook.com/groups/<groupId>/user/<yourUserId>/
    ```
 
 3. A small dark panel appears in the bottom-right corner titled
-   `Export: group <gid> / user <uid>`, with two buttons:
+   `Export: group <gid> / user <uid>` (or `Export group <gid> (all members)`),
+   with two buttons:
    - **Full Scan + Export** — auto-scrolls the entire feed, expands
      "See more", crawls multi-photo carousels, and then downloads one ZIP.
    - **Export Loaded Now** — exports only what is currently rendered in the
      DOM (useful for testing or quick spot exports).
 
 4. When the run finishes you'll get one download:
-   - `fb-export-<gid>-user-<uid>-<timestamp>.zip`
+   - `fb-export-<gid>-user-<uid>-<timestamp>.zip` (specific user) or
+     `fb-export-<gid>-<timestamp>.zip` (all members)
    - `export.json` inside the ZIP has one record per post: permalink,
      timestamp, text, external links, and photo URLs.
-   - Downloaded photos are stored by post (`post-001/photo-01.jpg`, …).
+   - Downloaded photos are stored by post (`post-001/photo-01.jpg`, …). Every
+     photo in a multi-photo / carousel post is captured.
    - If any photo downloads fail, the ZIP also includes `photo-failures.json`.
 
 ## Render an export as HTML
@@ -84,9 +93,11 @@ All runtime knobs live in the `CONFIG` object at the top of the userscript:
 - `EOF_*` — end-of-feed detection thresholds.
 - `GALLERY_CRAWL_ENABLED`, `GALLERY_CRAWL_*` — controls the hidden-photo
   crawler that fetches photo-viewer pages via `GM_xmlhttpRequest`.
-- `CAROUSEL_SCRIPT_EXTRACT_ENABLED` / `CAROUSEL_CRAWL_ENABLED` — toggles
-  for the two carousel extraction strategies (embedded script state vs.
-  interactive photo viewer; see [DEVELOPMENT.md](./DEVELOPMENT.md)).
+- `CAROUSEL_SCRIPT_EXTRACT_ENABLED` / `CAROUSEL_CRAWL_ENABLED` /
+  `CAROUSEL_CRAWL_TARGETED_CAPS_ENABLED` — the three carousel extraction
+  strategies (embedded script state, targeted "+N" grid crawl, broad
+  interactive viewer crawl). All three are enabled by default; see
+  [DEVELOPMENT.md](./DEVELOPMENT.md).
 - `DRY_RUN` — emit validation summary to the console but skip the
   ZIP download.
 

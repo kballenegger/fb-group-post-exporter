@@ -4,13 +4,13 @@
   "description": "",
   "main": "export-group-posts-by-user.user.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --check export-group-posts-by-user.user.js && node --check render-export.mjs && node --check run.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "puppeteer-core": "^24.41.0"
+    "puppeteer-core": "^25.8.0"
   }
 }

@@ -15,10 +15,17 @@ CDP runner. Companion to [README.md](./README.md).
 
 ## URL contract
 
-The userscript only activates on `https://www.facebook.com/groups/<gid>/user/<uid>/`
-(enforced by `@match` *and* a runtime regex). Both the group ID and user ID
-are parsed from `window.location.href` by `parseIdsFromUrl()` — there are no
-hardcoded IDs anywhere in the userscript.
+The userscript activates on two page shapes (enforced by `@match` and
+`@include` *and* a runtime regex):
+
+- `https://www.facebook.com/groups/<gid>/user/<uid>/` — **specific user
+  mode**: exports only posts by that member (`SPECIFIC_USER_MODE`).
+- `https://www.facebook.com/groups/<gid>/` — **all-members mode**: exports
+  every member's posts (`SPECIFIC_USER_MODE` is false).
+
+IDs are parsed from `window.location.href` by `parseIdsFromUrl()` — there are
+no hardcoded IDs anywhere in the userscript. In all-members mode `userId` is
+an empty string and the `isPostByRequestedUser` filter is skipped.
 
 ## Extraction pipeline
 
@@ -66,21 +73,26 @@ non-comment `[role="article"]`):
    `GM_xmlhttpRequest` and mines embedded JSON `"uri":"…"` values, the
    `og:image` meta tag, and `data-src`/`src` attrs. Follows "next photo"
    links up to `GALLERY_CRAWL_MAX_PAGES_PER_POST` hops.
-7. **Carousel photos** — two independent strategies (both off by default is
-   also valid):
+7. **Carousel photos** — three independent strategies, all enabled:
    - **Script-state extraction** (`extractCarouselFromScripts`) — walks
      `<script>` tags that mention the post ID, pulls every `"uri":"…"`
      under `t<N>.<M>-<K>/`, dedupes by the middle-fbid, and requires that
      each fbid share a long common prefix with the post's visible photo
      fbids (carousel siblings are minted sequentially, so this prefix
      heuristic cleanly rejects commenter avatars and link-preview thumbs
-     that happen to be in the same JSON blob).
+     that happen to be in the same JSON blob). Depends on the script-state
+     blob being present for the post; when it is, it recovers every hidden
+     photo with no interactive navigation.
+   - **Targeted "+N" grid crawl** (`CAROUSEL_CRAWL_TARGETED_CAPS_ENABLED`) —
+     opens only tiles that show a remaining-count (the `+N` overlay) via
+     `hasCappedPhotoGrid`, crawling the viewer until it loops or closes.
    - **Interactive viewer crawl** (`crawlCarousel`) — opens the photo
      viewer, captures the current image, clicks "next", repeats until it
      loops back to the starting image, the viewer closes, or a pending/
-     lazy-load budget is exhausted. Disabled by default
-     (`CAROUSEL_CRAWL_ENABLED: false`) because the viewer can hijack SPA
-     routing and destroy feed state if FB's DOM shifts mid-run.
+     lazy-load budget is exhausted. Note: the viewer can hijack SPA
+     routing and destroy feed state if FB's DOM shifts mid-run; it is
+     scoped to the viewer container and scroll position is restored
+     afterwards. Used as a last-resort fallback for multi-photo posts.
 8. **De-duplicate** by `urlPathKey(url)` (origin + pathname), preferring
    non-thumbnail variants where available.
 
@@ -104,12 +116,29 @@ A limited number of **retry bursts** (`RETRY_BURSTS`) force-scroll to the
 bottom before giving up, since Facebook's virtualized feed sometimes
 defers loading until the viewport is actually near the bottom.
 
-### Photo-URL quality upgrade
+### Photo-URL quality upgrade and 403 mitigation
 
 `upgradeToHighRes` strips the `stp=` size/transform parameter from FB CDN
 URLs (e.g. `p180x540`, `cp0_dst-jpg`), which causes the CDN to serve the
 original-resolution variant. `parseBestSrcset` picks the highest `Nw` entry
-from an `srcset`.
+from an `srcset`. The original signed URL is always kept as a fallback
+candidate (`photoFetchCandidatesByPath`), so if the stripped high-res variant
+403s, the export retries with the original signed URL.
+
+The photo 403 problem is tackled from four angles at once:
+
+1. **Referer/Origin headers** — every `GM_xmlhttpRequest` photo fetch sends
+   `Referer: https://www.facebook.com/` and `Origin: https://www.facebook.com`.
+2. **`@connect` grants** — the userscript header grants `scontent.fbcdn.net`
+   and `scontent-*.fbcdn.net` in addition to `fbcdn.net` / `*.fbcdn.net`.
+3. **Prefetch during scan** — `PREFETCH_PHOTOS_DURING_SCAN` (default on)
+   downloads photo bytes right after extraction, while the signed URLs are
+   still fresh, caching them for the export phase. The export phase serves
+   from that cache first and only hits the network on a cache miss.
+4. **Retry + fallback chain** — each URL attempt retries once on 403/5xx,
+   then falls back to alternate candidate URLs (original signed URL last).
+
+### Photo-URL quality upgrade
 
 ## UI
 
