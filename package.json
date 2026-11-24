@@ -4,6 +4,7 @@
   "description": "",
   "main": "export-group-posts-by-user.user.js",
   "scripts": {
+    "filter:hotel-reviews": "node filter-hotel-reviews.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

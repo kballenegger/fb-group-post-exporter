@@ -4,6 +4,7 @@ node_modules/
 # Local exporter output (real scraped data + per-run zips)
 output/
 fb-group-*
+fb-export-*
 fb-photos-*
 
 # Captured Facebook traffic used only during debugging
